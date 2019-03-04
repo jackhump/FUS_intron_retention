@@ -1,0 +1,1209 @@
+---
+title: "Splicing event Plotting"
+author: "Jack Humphrey"
+date: "30/01/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "~/google_drive/Work/PhD_Year_4/FUS_meta-analysis/")
+library(SGSeq)
+library(DEXSeq)
+library(purrr)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(stringr)
+library(UpSetR)
+library(readr)
+library(gProfileR)
+library(plotly)
+library(patchwork)
+library(ggbeeswarm)
+```
+
+# This is for all the downstream plots and analysis created from res.clean and psi_df
+# This follows on from 03_SGSeq_variant_function.Rmd
+
+```{r}
+load("results/03_SGSeq/sgseq_splicing_event_function.RData")
+
+combined <- read_tsv("results/03_SGSeq/combined_sgseq_joint_splicing_total.tsv")
+```
+
+# Printing splicing results for supplementaries
+
+```{r}
+res.clean$groupID <- as.numeric(res.clean$groupID)
+res.clean$featureID <- as.numeric(res.clean$featureID)
+all_splicing <- left_join(res.clean, combined )
+
+all_splicing_sup <- 
+  select(all_splicing,
+       EnsemblID = "ensemblID", Gene =  "gene", coords_mm10 = "coords", 
+       event_length = "event.length", 
+       Fratta_wildtype_expression = "frattaBaseMean", 
+       LFC_KO = "lfc_ko", P_KO = "P_ko", FDR_KO = "FDR_ko", 
+       LFC_MUT = "lfc_mut", P_MUT = "P_mut", FDR_MUT = "FDR_mut", 
+       Overlap_strict = "status_strict",
+       Overlap_relaxed = "status_relaxed",
+       iCLIP_FUS_distance = "iclip.distance", iCLIP_TDP_distance = "iclip.distance.tdp",
+       iCLIP_U2AF_distance = "iclip.distance.u2af", median_phyloP = "phyloP"
+       )  %>%
+  arrange(P_KO)
+
+write_csv(all_splicing_sup, "results/tables/joint_model_splicing.csv")
+
+```
+
+
+
+# Gene Ontology for splicing events
+
+
+```{r gene_ontology}
+# split by status_relaxed
+grouped_genes <- res.clean %>%
+  filter(status_relaxed != "None") %>%
+  filter(type %in% c("RI", "SE", "COMPLEX")) %>%
+  split( paste(.$status_relaxed, .$type) ) %>%
+  map("gene")
+
+set_sizes <- map(grouped_genes, length) %>%
+  tibble( set = names(.), n = . ) %>%
+  mutate( n = unlist(n))
+
+#readr::write_tsv(x = set_sizes, path ="results/03_SGSeq/Gene_ontology_set_numbers.tsv")
+
+# call gProfiler on each group with strong filtering
+gprofile_strict <- gprofiler( query = grouped_genes, 
+                       organism = "mmusculus", 
+                       src_filter = c("GO", "KEGG", "REAC", "CORUM"),
+                       hier_filtering = "strong" )
+
+gprofile_all <- gprofiler( query = grouped_genes, 
+                       organism = "mmusculus", 
+                       src_filter = c("GO", "KEGG", "REAC", "CORUM"), 
+                       hier_filtering = "none"
+                       )
+
+# save gprofile all
+readr::write_tsv(x = gprofile_all, path = "results/03_SGSeq/Splicing_Gene_ontology_full_results.tsv")
+
+# plot GO term p values for complex, retained intron and cassette exons
+type_translation <-
+  c( "COMPLEX" = "complex\nvariants",
+     "RI" = "retained\nintrons",
+     "SE" = "cassette\nexons")
+
+
+term_remove <- c()
+
+main_plot_cols <- c("Overlapping" = "purple", 
+                    "Mutation specific" = "dodgerblue",
+                    "Knockout specific" = "firebrick2")
+
+
+to_plot <-
+    gprofile_strict
+
+GO_term_plot <-
+  to_plot %>%
+  filter( overlap.size >= 5) %>%
+  arrange( log10(p.value) ) %>%
+  ggplot( aes( x = term.name, y = -log10(p.value) ) ) + 
+    geom_col(aes(fill = query.number)) + 
+    facet_grid( query.number ~ ., space = "free", scales = "free" ) + 
+  coord_flip() + 
+  theme_classic() +
+  guides(fill=FALSE) +
+  ylab(label = expression(log[10]~(P~value)) ) +
+  xlab("") +
+  theme(strip.background = element_blank()) +
+  theme(strip.text.y = element_text(face = "bold",angle = 0)) +
+  #labs(title = unique(group_name) ) +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_x_discrete()
+
+GO_term_plot
+ggsave(plot = GO_term_plot, filename = "figures/splicing/GO_terms_by_group.pdf",
+       width = 7, height = 10)
+
+
+gprofile.split <- split(gprofile_all, gprofile_all$query.number)
+
+GO_summary <- bind_rows( 
+  genes = map_df( grouped_genes, length),
+  terms = map_df( gprofile.split, nrow)
+) %>% 
+  t() %>%
+  as.data.frame()
+
+```
+
+
+Fascinating! The only categories with large amounts of GO enrichment are retained introns and complex events. Even more interesting, only the intron retention events where the retention isoform DECREASES are enriched for GO terms. What are those GO terms?
+
+# Length and expression plotting for iCLIP
+
+
+Whether a region has a CLIP peak in is correlated to the expression level of that region.
+
+```{r}
+n.bins <- 20
+# fratta
+p1 <- res.clean %>%
+  arrange(frattaBaseMean) %>%
+  filter(frattaBaseMean > 1) %>%
+  mutate( bin = ntile(x = frattaBaseMean, n = n.bins)) %>%
+  group_by( bin) %>% 
+  summarise( FUS = sum(iclip.distance == 0)/(nrow(res.clean)/n.bins),
+             TDP43 = sum(iclip.distance.tdp == 0)/(nrow(res.clean)/n.bins),
+             U2AF65 = sum(iclip.distance.u2af == 0)/(nrow(res.clean)/n.bins)) %>%
+  tidyr::gather(key = "protein", value = "prop", -bin) %>%
+  ggplot( aes(x = bin, y = prop)) + geom_point(aes(colour = protein)) +
+  labs(subtitle = "Binned by Fratta wildtype read count") +
+  theme_classic() +
+  ylim(0,1) +
+  guides(colour=FALSE) +
+  scale_x_continuous(breaks = c(0,n.bins))
+
+
+p2 <- res.clean %>%
+  #filter(type == "RI") %>%
+  arrange(event.length) %>%
+  #filter() %>%
+  mutate( bin = ntile(x = event.length, n = n.bins)) %>%
+  group_by( bin) %>% 
+  summarise( FUS = sum(iclip.distance == 0)/n(),
+             TDP43 = sum(iclip.distance.tdp == 0)/n(),
+             U2AF65 = sum(iclip.distance.u2af == 0)/n(),
+             med.length = median(event.length)) %>%
+  tidyr::gather(key = "protein", value = "prop", -bin, -med.length) %>%
+  ggplot( aes(x = bin, y = prop)) + geom_point(aes(colour = protein)) +
+  labs(subtitle = "Binned by event length") +
+  theme_classic() +
+  ylim(0,1) +
+  scale_x_continuous(breaks = c(0,n.bins))
+
+
+clip_expression_plot <- p1 + p2 + plot_layout(nrow=1)
+
+clip_expression_plot
+
+ggsave(plot = clip_expression_plot,
+       filename = "figures/splicing/splicing_expression_clip_dependence_supplementary.pdf", 
+       width =8, height = 4)
+```
+
+The length of the splicing event also matters.
+
+
+Clearly iCLIP overlap depends strongly on wildtype expression for FUS,TDP and especially U2AF65.
+
+Are the overlapping splicing events particularly highly expressed?
+
+```{r}
+
+main_plot_cols <- c("Overlapping" = "purple", 
+                    "Mutation specific" = "dodgerblue",
+                    "Knockout specific" = "firebrick2",
+                    "None" = "gray")
+
+
+splicing_expression_type_plot <-
+  res.clean %>%
+  filter(type %in% c("RI","SE","COMPLEX")) %>%
+  mutate(type = case_when(
+    type == "RI" ~ "Retained introns",
+    type == "SE" ~ "Cassette exons",
+    type == "COMPLEX" ~ "Complex events" 
+  )) %>%
+  filter(status_relaxed != "Mutation specific") %>%
+  ggplot(aes(x = log10(frattaBaseMean) ) ) +
+  geom_density(aes(fill = status_relaxed), alpha = 0.5) +
+  theme_classic() +
+  scale_fill_manual(values = main_plot_cols) +
+  facet_wrap(~type, nrow=1) +
+  xlab("log10 wildtype read depth") +
+    theme(panel.background = element_blank(),
+         panel.border = element_blank(),
+         panel.grid = element_blank(),
+         strip.background = element_blank()
+)
+  
+
+splicing_length_type_plot <-
+  res.clean %>%
+  filter(type %in% c("RI","SE","COMPLEX")) %>%
+  mutate(type = case_when(
+    type == "RI" ~ "Retained introns",
+    type == "SE" ~ "Cassette exons",
+    type == "COMPLEX" ~ "Complex events" 
+  )) %>%
+  filter(status_relaxed != "Mutation specific") %>%
+  ggplot(aes(x = log10(event.length) ) ) +
+  geom_density(aes(fill = status_relaxed), alpha = 0.5) +
+  theme_classic() +
+  scale_fill_manual(values = main_plot_cols) +
+  facet_wrap(~type, nrow=1) +
+  xlab("log10 event length (bp)") +
+  theme(panel.background = element_blank(),
+         panel.border = element_blank(),
+         panel.grid = element_blank(),
+         strip.background = element_blank()
+)
+
+splicing_confounder_plot <-
+  splicing_expression_type_plot + 
+  splicing_length_type_plot +
+  plot_layout(nrow=2) 
+
+splicing_confounder_plot
+
+ggsave(splicing_confounder_plot, filename = "figures/splicing/splicing_confounding_supplementary.pdf", height = 4, width = 6)
+```
+
+
+
+# Proportion plots
+
+
+Split variants by type and compare number of variants that overlap a cleavage site (within the coordinates of the variant) in significant variants versus non-significant variants. Use a proportion test.
+
+1. Functions
+
+```{r}
+
+# create enrichment p-values from proportion test
+# default behaviour is to create corrected null
+proportion_test <- 
+  function(res, 
+           column = "polya.distance", 
+           phyloP_threshold = 0.5, 
+           depthCorrect = TRUE, 
+           lengthCorrect = TRUE){
+  if( "Overlapping" %in% res$status_relaxed ){
+    status <- "Overlapping"
+  }
+  if( "Knockout specific" %in% res$status_relaxed){
+    status <- "Knockout specific"
+  }
+  prop_table <- 
+    res %>%
+    filter( !is.na(phyloP) & type %in% c("SE", "RI", "COMPLEX")) %>% 
+    split(.$type) %>%
+    map_df( ~{
+      # get sig and null sets 
+      sig <- filter(.x, status_relaxed != "None")
+      # default null - no correction
+      null <- filter(.x, status_relaxed == "None")
+      print(dim(null))
+      if( depthCorrect == TRUE){
+      # depth correction - take a null set where the genes have wildtype fratta
+      # expression within the range of the sig genes
+        sig_depth <- log10(sig$frattaBaseMean) 
+        quartile1 <- summary(sig_depth)[2]
+        quartile3 <- summary(sig_depth)[5]
+
+        null <- filter(null,                         
+                       frattaBaseMean >= 10^quartile1 &
+                       frattaBaseMean <= 10^quartile3
+                       )
+      }
+      
+      if( lengthCorrect == TRUE){
+        sig_length <- log10(sig$event.length)
+        quartile1 <- summary(sig_length)[2]
+        quartile3 <- summary(sig_length)[5]
+        
+        null <- filter(null,
+                       event.length >= 10^quartile1 &
+                         event.length <= 10^quartile3
+                       )
+        
+      }
+
+      
+      # totals
+      total_col <-
+        c(
+          nrow(sig),
+          nrow(null)
+        )
+      
+      print(total_col)
+      # pick overlap column to look at
+      if( column == "polya.distance"){
+        overlap_col <- 
+          c(
+            sum(sig$polya.distance == 0, na.rm = TRUE),
+            sum(null$polya.distance == 0, na.rm = TRUE)
+          )
+      }
+      if( grepl("iclip.distance", column) ){
+        overlap_col <- 
+          c(
+            sum(sig[[column]] == 0),
+            sum(null[[column]] == 0)
+          )
+      }
+      if( column == "phyloP"){
+        overlap_col <- 
+          c(
+            sum(sig$phyloP > phyloP_threshold, na.rm = TRUE),
+            sum(null$phyloP > phyloP_threshold, na.rm = TRUE)
+          )
+      }
+      if( column == "minor.gene"){
+        overlap_col <- 
+          c(
+            sum(sig$minor.gene == TRUE, na.rm = TRUE),
+            sum(null$minor.gene == TRUE, na.rm = TRUE)
+          )
+      }
+      
+      # prepare table
+      res_table <- 
+        tibble(
+          status_relaxed = status,
+          set = c("sig", "null"),
+          total = total_col,
+          overlap = overlap_col,
+          freq = overlap / total
+        )
+      res_table$pvalue <-
+        c(
+          prop.test(x = res_table$overlap, n = res_table$total, p = NULL)$p.value,
+          NA
+        )
+      # convert to scientific notation
+      #res_table$pvalue <- formatC(res_table$pvalue, format = "e", digits = 2)
+      #res_table$pvalue[ res_table$pvalue == " NA"] <- NA
+      return(res_table)
+    }, .id = "type")
+  return( list(table = prop_table, plot_type = column))
+}
+
+
+#########
+### plotting
+
+proportion_plot <- function(results, pvalue_y =0.3, hide_y=FALSE){
+  #pvalue_y = 0.3
+  # for testing
+  #pvalue_y = 1
+  y_lab <- 
+    case_when(
+      results$plot_type == "minor.gene" ~ "Events in minor intron genes",
+      results$plot_type == "phyloP" ~ "Median PhyloP\nconservation > 0.5",
+      results$plot_type == "polya.distance" ~ "Proportion overlapping\npolyA site",
+      grepl( "iclip.distance" ,results$plot_type ) ~ "Proportion overlapping\niCLIP cluster")
+  
+  plot_colours <- c(
+    "Overlapping" = "purple",
+    "Knockout specific" = "firebrick2"
+  )
+  
+  plot_title <- unique(results$table$status_relaxed)
+  
+  plot_alpha <- c( "sig" = 1, "null" = 0.2)
+  
+  type_translation <-
+    rev(c( "COMPLEX" = "complex event",
+       "RI" = "retained intron",
+       "SE" = "cassette exon"))
+  
+  res <- results$table
+  #results$type <- factor(results$type, levels = rev(c("COMPLEX","RI","SE")))
+  
+  res$type <- type_translation[res$type]
+  res$type <- factor(res$type, 
+                               levels = rev(c("complex event","retained intron","cassette exon")))
+  
+  #return(res)
+  
+  sig <- filter(res, set == "sig")
+  null <- filter(res, set == "null")
+  
+  # use adjusted p values if present
+  if( !"q" %in% names(sig) ){
+    sig$q <- sig$pvalue
+  }
+  
+  plot <-
+    sig %>%
+    #filter( type %in% c("RI", "COMPLEX", "SE") ) %>%
+    mutate( pvalue = paste0(signif(pvalue, digits =3))) %>%
+    mutate( pvalue = ifelse(grepl("NA",pvalue), NA, pvalue)) %>%
+    mutate( q = paste0(signif(q, digits =2))) %>%
+    mutate( q = ifelse(grepl("NA",q), NA, q)) %>%
+    mutate( set = factor(set, levels = c("sig", "null"))) %>%
+    #mutate( set = factor(set, levels = c("sig", "null"))) %>%
+    ggplot() +
+    geom_col( aes(x = type, y = freq, alpha = set, fill = status_relaxed  ), position = position_identity() ) +
+    geom_errorbar(data = null, aes(x = type, ymin = freq, ymax = freq ), width = 1, colour = "black", linetype = 2 ) +
+    scale_fill_manual(values = plot_colours) +
+    #geom_segment( data = filter(to_plot, set == "null"), aes(x = 0, xend = type, y = freq, yend = freq), linetype = 3) +
+    #facet_grid(type ~ ., labeller = labeller(type = type_translation) ) +
+    ylab(y_lab) +
+    #coord_flip() +
+    scale_alpha_manual(values = plot_alpha) +
+    theme_classic() +
+    xlab("") +
+    #scale_x_discrete(labels = type_translation) +
+    theme(strip.background = element_blank()
+          ) +
+    # use corrected p value - q - instead
+    geom_text(aes(label = q, y = pvalue_y, x = type), size = 2.75) +
+    #geom_text(aes(label = pvalue, y = pvalue_y, x = type), size = 2.75) +
+    geom_point( aes(y = pvalue_y + 0.05, x = 1.5), colour = NA) +
+    theme(plot.subtitle = element_text(hjust=0.5),
+          strip.text.y = element_text(face = "bold",angle = 0), 
+          axis.text = element_text(colour = "black"),
+          axis.ticks = element_line(colour = "black") 
+          ) +
+    #labs(title = unique(group_name) ) +
+    scale_y_continuous(expand = c(0, 0), position = "left",labels = scales::percent_format(accuracy = 1)) +
+    #scale_x_discrete() +
+    guides(alpha = FALSE, fill = FALSE) +
+    coord_flip()
+    #labs( title = plot_title) + 
+    #theme(plot.title = element_text(hjust = 0.5, size = 12,face = "bold"))
+  
+  if( hide_y == TRUE){
+    plot <- plot +
+      theme(axis.title.y = element_blank(), axis.ticks.y = element_blank(), axis.text.y = element_blank()
+            )
+  }
+  return(plot)
+}
+
+
+```
+
+2. Assembling the plots
+
+```{r}
+#proportion_plot(overlap_phyloP)
+
+overlapping_res <- filter(res.clean, status_relaxed %in% c("Overlapping", "None") )
+ko_res <- filter(res.clean, status_relaxed %in% c("Knockout specific", "None") )
+
+# bonferroni correction over multiple plots
+correctProportionP <- function(table_list){
+  table_list %>%
+  map_df( ~{
+    table <- .x$table
+    table$data <- .x$plot_type
+    return(table)
+  }) %>%
+  mutate(q = p.adjust(pvalue, method = "bonferroni")) %>%
+  split( paste(.$data,.$status_relaxed) ) %>%
+  map( ~{
+    plot_type <- unique(paste(.x$data))
+    .x$data <- NULL
+    return( list(table = .x, plot_type = plot_type))
+  } )
+}
+```
+
+```{r}
+# polya
+overlap_polya <- proportion_test(overlapping_res, column = "polya.distance",depthCorrect = TRUE, lengthCorrect = TRUE)
+ko_polya <- proportion_test(ko_res, column = "polya.distance",depthCorrect = TRUE, lengthCorrect = TRUE)
+# iclip
+overlap_iclip <- proportion_test(overlapping_res, column = "iclip.distance",depthCorrect = TRUE, lengthCorrect = TRUE)
+ko_iclip <- proportion_test(ko_res, column = "iclip.distance",depthCorrect = TRUE, lengthCorrect = TRUE)
+# conservation
+overlap_phyloP <- proportion_test(overlapping_res, column = "phyloP",depthCorrect = TRUE, lengthCorrect = TRUE)
+ko_phyloP <- proportion_test(ko_res, column = "phyloP",depthCorrect = TRUE, lengthCorrect = TRUE)
+
+
+# # bind together all overlap tables and adjust p values
+# all_tables <- list( overlap_iclip, overlap_polya, overlap_phyloP, ko_iclip, ko_polya, ko_phyloP)
+# # bind together in one table, correct P values and then split again
+# 
+# 
+# # use corrected tables for plotting
+# corrected_tables <- correctProportionP(all_tables)
+#   
+# # plotting
+# multi_plot <-
+#   proportion_plot(corrected_tables$`polya.distance Overlapping`) + 
+#   proportion_plot(corrected_tables$`polya.distance Knockout specific`, hide_y = TRUE ) +
+#   proportion_plot(corrected_tables$`iclip.distance Overlapping`) + 
+#   proportion_plot(corrected_tables$`iclip.distance Knockout specific`, hide_y = TRUE ) +
+#   proportion_plot(corrected_tables$`phyloP Overlapping`) + 
+#   proportion_plot(corrected_tables$`phyloP Knockout specific`,hide_y = TRUE ) +
+#   plot_layout(nrow = 3)
+# 
+# multi_plot
+# 
+# ggsave(multi_plot, filename = "figures/splicing/function_multipanel.pdf", width = 4.2, height = 6.2)
+
+# for paper:
+# KO specific and Overlappping FUS iCLIP together
+both_fus_iclip <- list(overlap_iclip, ko_iclip)
+both_fus_iclip <- correctProportionP(both_fus_iclip)
+
+# for testing
+fus_iclip_plot <- 
+  proportion_plot(both_fus_iclip$`iclip.distance Knockout specific`) +
+  proportion_plot(both_fus_iclip$`iclip.distance Overlapping`, hide_y = TRUE)
+
+ggsave("figures/splicing/fus_iclip_ko_overlap.pdf",plot = fus_iclip_plot, width = 5, height = 3)
+
+#KO specific and Overlapping PhyloP
+
+both_PhyloP <- list(overlap_phyloP, ko_phyloP)
+both_PhyloP <- correctProportionP(both_PhyloP)
+
+phyloP_plot <- 
+  proportion_plot(both_PhyloP$`phyloP Knockout specific`) +
+  proportion_plot(both_PhyloP$`phyloP Overlapping`, hide_y = TRUE)
+
+ggsave("figures/splicing/phyloP_ko_overlap.pdf",plot = phyloP_plot, width = 5, height = 3)
+
+
+```
+
+Controls with U2AF
+
+```{r}
+
+# compare iclip between FUS, TDP-43 and U2AF65
+overlap_iclip_fus <- proportion_test(overlapping_res, column = "iclip.distance",depthCorrect = TRUE, lengthCorrect = TRUE)
+ko_iclip_fus <- proportion_test(ko_res, column = "iclip.distance",depthCorrect = TRUE, lengthCorrect = TRUE)
+
+overlap_iclip_tdp <- proportion_test(overlapping_res, column = "iclip.distance.tdp",depthCorrect = TRUE, lengthCorrect = TRUE)
+ko_iclip_tdp <- proportion_test(ko_res, column = "iclip.distance.tdp",depthCorrect = TRUE, lengthCorrect = TRUE)
+
+overlap_iclip_u2af <- proportion_test(overlapping_res, column = "iclip.distance.u2af",depthCorrect = TRUE, lengthCorrect = TRUE)
+ko_iclip_u2af <- proportion_test(ko_res, column = "iclip.distance.u2af",depthCorrect = TRUE, lengthCorrect = TRUE)
+
+# correct p values
+iclip_tables_corrected <- 
+  correctProportionP( list(overlap_iclip_fus, overlap_iclip_tdp, overlap_iclip_u2af,
+                           ko_iclip_fus, ko_iclip_tdp, ko_iclip_u2af) )
+
+
+iclip_multiplot <-
+  ( proportion_plot(iclip_tables_corrected$`iclip.distance Overlapping`,pvalue_y = 1) + 
+  labs(title = "Fus") + 
+  proportion_plot(iclip_tables_corrected$`iclip.distance.tdp Overlapping`, pvalue_y =1,hide_y = TRUE) + 
+  labs(title = "Tdp43") +
+   proportion_plot(iclip_tables_corrected$`iclip.distance.u2af Overlapping`,pvalue_y = 1, hide_y = TRUE) + 
+  labs(title = "U2af65") ) /
+    ( proportion_plot(iclip_tables_corrected$`iclip.distance Knockout specific`,pvalue_y = 1) + 
+  labs(title = "Fus") + 
+  proportion_plot(iclip_tables_corrected$`iclip.distance.tdp Knockout specific`, pvalue_y =1,hide_y = TRUE) + 
+  labs(title = "Tdp43") +
+   proportion_plot(iclip_tables_corrected$`iclip.distance.u2af Knockout specific`,pvalue_y = 1, hide_y = TRUE) + 
+  labs(title = "U2af65") )
+
+ggsave(filename = "figures/splicing/iclip_fus_u2af_tdp_overlapping_proportions.pdf",plot = iclip_multiplot, height = 4, width = 6)
+
+```
+
+# 3. more assembly
+
+
+Show stepwise inclusion of correction parameters
+
+
+```{r}
+#res.clean$phyloP <- 1
+overlapping_res <- filter(res.clean, status_relaxed %in% c("Overlapping", "None") )
+
+# 1. without correction for comparison
+
+overlap_iclip_fus <- proportion_test(overlapping_res, column = "iclip.distance",depthCorrect = FALSE)
+overlap_iclip_tdp <- proportion_test(overlapping_res, column = "iclip.distance.tdp",depthCorrect = FALSE)
+overlap_iclip_u2af <- proportion_test(overlapping_res, column = "iclip.distance.u2af",depthCorrect = FALSE)
+
+overlap_iclip <-
+  proportion_plot(overlap_iclip_fus) + labs(subtitle = "Fus") + 
+  proportion_plot(overlap_iclip_tdp) + labs(subtitle = "Tdp43") +
+   proportion_plot(overlap_iclip_u2af) + labs(subtitle = "U2af65")
+
+# retry with depth correction
+overlap_iclip_fus <- proportion_test(overlapping_res, column = "iclip.distance",depthCorrect = TRUE)
+overlap_iclip_tdp <- proportion_test(overlapping_res, column = "iclip.distance.tdp",depthCorrect = TRUE)
+overlap_iclip_u2af <- proportion_test(overlapping_res, column = "iclip.distance.u2af",depthCorrect = TRUE)
+
+overlap_iclip_depth <-
+  proportion_plot(overlap_iclip_fus) + labs(subtitle = "Fus") + 
+  proportion_plot(overlap_iclip_tdp) + labs(subtitle = "Tdp43") +
+   proportion_plot(overlap_iclip_u2af) + labs(subtitle = "U2af65")
+
+
+# now with length correction
+overlap_iclip_fus <- proportion_test(overlapping_res, column = "iclip.distance",lengthCorrect = TRUE)
+overlap_iclip_tdp <- proportion_test(overlapping_res, column = "iclip.distance.tdp",lengthCorrect = TRUE)
+overlap_iclip_u2af <- proportion_test(overlapping_res, column = "iclip.distance.u2af",lengthCorrect = TRUE)
+
+overlap_iclip_length <-
+  proportion_plot(overlap_iclip_fus) + labs(subtitle = "Fus") + 
+  proportion_plot(overlap_iclip_tdp) + labs(subtitle = "Tdp43") +
+   proportion_plot(overlap_iclip_u2af) + labs(subtitle = "U2af65")
+
+
+# try both!
+overlap_iclip_fus <- proportion_test(overlapping_res, column = "iclip.distance",lengthCorrect = TRUE, depthCorrect = TRUE)
+
+overlap_iclip_tdp <- proportion_test(overlapping_res, column = "iclip.distance.tdp",lengthCorrect = TRUE, depthCorrect = TRUE)
+
+overlap_iclip_u2af <- proportion_test(overlapping_res, column = "iclip.distance.u2af",lengthCorrect = TRUE, depthCorrect = TRUE)
+
+overlap_iclip_length_depth <-
+  # proportion_plot(overlap_iclip_fus) + labs(subtitle = "Fus") + 
+  # proportion_plot(overlap_iclip_tdp) + labs(subtitle = "Tdp43") +
+   proportion_plot(overlap_iclip_u2af) + labs(subtitle = "U2af65")
+
+
+
+#correction_plot <-
+correction_plot_overlap <- 
+  (overlap_iclip + labs(title = "1. no correction" )) /
+  (overlap_iclip_depth + labs(title = "2. correction for depth")) /
+  (overlap_iclip_length + labs(title = "3. correction for length")) /
+  (overlap_iclip_length_depth + labs(title = "4. length and depth"))
+
+
+ggsave(plot = correction_plot_overlap, filename = "figures/splicing/splicing_iclip_overlapping_correction_multiplot.pdf", width = 10, height = 9)
+
+
+#correction_plot
+
+```
+
+# Minor Intron genes
+
+```{r}
+overlap_minor <- 
+  proportion_test(overlapping_res, column = "minor.gene",lengthCorrect = TRUE, depthCorrect = TRUE)
+
+ko_minor <- proportion_test(ko_res, column = "minor.gene",lengthCorrect = TRUE, depthCorrect = TRUE)
+
+minor_tables <- correctProportionP(list(overlap_minor, ko_minor))
+
+minor_plot <-
+  proportion_plot(minor_tables$`minor.gene Overlapping`, pvalue_y = 0.1) +
+  proportion_plot(minor_tables$`minor.gene Knockout specific`, pvalue_y = 0.1, hide_y = TRUE)
+
+ggsave(plot = minor_plot, filename = "figures/splicing/minor_intron_splicing_proportion.pdf", 
+       width = 6, height = 4)
+
+```
+
+
+
+Of all the splicing variants detected by SGSeq in FUS KO and FUS MUT conditions, the most intriguing are those which contain retained introns. These introns segregate by direction of fold change as introns that are more retained in control samples and less so in FUS KO/MUT samples are:
+  * enriched in RNA-binding genes
+  * enriched in FUS iCLIP peaks
+  * enriched in proximity to polyadenylation cleavage sites
+  * enriched in highly conserved sequence
+ 
+
+
+Make table of intron retention events. Include:
+name
+iclip 
+conservation
+whether gene is in "RNA binding" GO term
+status - overlapping or specific
+
+Plot intron retention events, show the fold changes. Show FUS, TAF15 and EWSR1
+
+```{r}
+
+overlapping_ri <- res.clean %>%
+  filter(status_relaxed == "Overlapping", type == "RI") %>%
+  pull(geneName) %>%
+  unlist()
+
+overlapping_ri_go <-
+  gprofiler( query = overlapping_ri,
+                       organism = "mmusculus",
+                       src_filter = c("GO", "KEGG", "REAC", "CORUM"),
+                       hier_filtering = "strong" )
+
+rna_genes <-
+  overlapping_ri_go %>% 
+  dplyr::select(term.name, p.value, term.size, overlap.size, intersection) %>%
+  dplyr::filter( grepl("RNA|splic", term.name))
+
+rna_gene_ids <- 
+  rna_genes$intersection %>%
+  str_split( pattern = ",") %>%
+  unlist() %>%
+  unique()
+
+rna_gene_res <- res.clean %>%
+  filter(status_relaxed == "Overlapping" | coords =="chr7:127974434-127975888", type == "RI") %>%
+  filter(geneName %in% rna_gene_ids  )
+
+# to send to Pietro:
+
+rna_gene_table <-
+  rna_gene_res %>%
+ # select(gene, coords, padj, geneName, log2fold_FUS_KO_CTL)
+  select(gene, coords, strand, log2fold_FUS_KO_CTL,  event.length, polya.distance, iclip.distance, phyloP) %>%
+  arrange(gene)
+
+# save
+
+write_tsv(rna_gene_table,path = "results/tables/rbp_splicing_events.tsv")
+
+
+# Make plots of iCLIP binding and PhyloP:
+
+rbp_plot <- rna_gene_table %>%
+  mutate(gene = paste(gene, coords))
+
+all_genes <- unique(rbp_plot$gene)
+all_genes <- all_genes[ order(all_genes)]
+gene_levels <- rev(c(all_genes[grepl("Fus", all_genes)], all_genes[ !grepl("Fus", all_genes)] ))
+
+
+
+# WRITE OUT TABLE HERE
+phyloP_rbp_plot <-
+  rbp_plot %>%
+  mutate( gene = factor(gene, levels = gene_levels)) %>%
+  mutate( measure = "PhyloP") %>%
+  ggplot( aes(x = measure, y = gene  ) ) +
+         geom_tile(aes(fill = phyloP)) +
+    scale_fill_gradient2(
+    low = "white", high = "black",
+    #low = scales::muted("red"), 
+    #mid = "white",
+    #high = scales::muted("blue"), 
+    midpoint = 0, space = "Lab",
+    na.value = "grey50", guide = "colourbar", aesthetics = "fill"
+  ) +
+  xlab("") +
+  ylab("") +
+  scale_y_discrete( expand = c(0, 0)) +
+  scale_x_discrete(expand = c(0,0),position = "top") +
+  theme(axis.text.x.top = element_text(angle = 270,vjust =0.66),
+        axis.text = element_text(colour = "black"),
+        axis.ticks = element_blank(),
+        legend.position="bottom",
+        legend.justification = "center")
+  #geom_text(aes(label = signif(dPSI, digits=2) ), size = 2) +
+
+phyloP_rbp_plot
+ 
+ggsave(plot = phyloP_rbp_plot, filename = "figures/splicing/PhyloP_heatmap_RBP_introns.pdf",
+       width = 3.5, height = 8, device = cairo_pdf)
+
+# plot iCLIP distance
+
+iclip_rbp_plot <-
+  rbp_plot %>%
+  mutate( gene = factor(gene, levels = gene_levels)) %>%
+  mutate( measure = "FUS iCLIP") %>%
+  mutate( iclip = case_when(
+    iclip.distance == 0 ~ "overlap",
+    iclip.distance <= 1000 ~ "within 1kb",
+    TRUE ~ "none"
+  )) %>%
+  ggplot( aes(x = measure, y = gene  ) ) +
+         geom_tile(aes(fill = iclip ), colour = NA) +
+  scale_fill_manual(values = c("overlap" = "black", "within 1kb" = "darkgrey", "none" = "white")) +
+  #   scale_fill_gradient2(
+  #   low = "blue", high = "red",
+  #   #low = scales::muted("red"), 
+  #   mid = "white",
+  #   #high = scales::muted("blue"), 
+  #   midpoint = 0, space = "Lab",
+  #   na.value = "grey50", guide = "colourbar", aesthetics = "fill"
+  # ) +
+  xlab("") +
+  ylab("") +
+  #guides(fill = FALSE) +
+  scale_y_discrete( expand = c(0, 0)) +
+  scale_x_discrete(expand = c(0,0),position = "top") +
+  theme(axis.text.x.top = element_text(angle = 270,vjust =0.66),
+        axis.text = element_text(colour = "black"),
+        axis.ticks = element_blank(),
+        legend.position="bottom",
+        legend.justification = "center")
+
+iclip_rbp_plot  
+
+ggsave(plot = iclip_rbp_plot, filename = "figures/splicing/iCLIP_heatmap_RBP_introns.pdf",
+       width = 3.5, height = 8, device = cairo_pdf)
+
+
+```
+
+# delta PSI values
+
+```{r}
+deltaPSItable <- function(fID){
+ # for testing FUS retained intron
+  #fID <- 133472 
+  psi <- filter(psi_df, featureID == fID, !is.na(condition)) 
+ 
+ # get summary PSIs
+ by_condition <- group_by(psi, condition)  %>%
+   summarise( mean.psi = mean(PSI)) %>%
+   mutate( condition = paste0(condition, ".all") )
+ # separate controls for Fratta and Dupuis
+ by_dataset <- 
+   psi %>%
+   mutate(condition = case_when(
+     grepl("Nicol_d14.*WT", sample_name) ~ "MUT_CTL",
+     grepl("Nicol_KO.*WT", sample_name) ~ "KO_CTL",
+     grepl("Dupuis_NLS-CTL", sample_name) ~ "MUT_CTL",
+     grepl("Dupuis_KO-CTL", sample_name) ~ "KO_CTL",
+     TRUE ~ condition
+   )) %>%
+   group_by(condition, dataset) %>%
+   summarise( mean.psi = mean(PSI, na.rm = TRUE) ) %>%
+   arrange(dataset) %>%
+   unite(col = "condition", dataset, condition, sep = ".",remove = TRUE)
+ 
+ # get deltaPSIs
+ dPSI.ko <- by_condition$mean.psi[2] - by_condition$mean.psi[1]
+ dPSI.mut <- by_condition$mean.psi[3] - by_condition$mean.psi[1]
+ 
+ # get deltaPSIs for each dataset comparison
+ # use separate controls!
+ dPSI.Bozzoni.mut <- by_dataset$mean.psi[3] - by_dataset$mean.psi[1]
+ dPSI.Bozzoni.ko <- by_dataset$mean.psi[2] - by_dataset$mean.psi[1]
+ 
+ dPSI.Dupuis.mut <- by_dataset$mean.psi[5] - by_dataset$mean.psi[7]
+ dPSI.Dupuis.ko <- by_dataset$mean.psi[4] - by_dataset$mean.psi[6]
+ 
+ dPSI.Fratta.mut <- by_dataset$mean.psi[9] - by_dataset$mean.psi[11] 
+ dPSI.Fratta.ko <- by_dataset$mean.psi[8] - by_dataset$mean.psi[10] 
+
+ 
+ total <- rbind( by_condition, by_dataset)
+ 
+ total <- data.frame(mean.psi = total$mean.psi, row.names = total$condition)
+ total <- as.data.frame(t(total))
+ 
+ total$dPSI.ko <- as.numeric(dPSI.ko)
+ total$dPSI.mut <- as.numeric(dPSI.mut)
+ 
+ total$dPSI.Bozzoni.mut <- dPSI.Bozzoni.mut 
+ total$dPSI.Bozzoni.ko <- dPSI.Bozzoni.ko
+ 
+ total$dPSI.Dupuis.mut <- dPSI.Dupuis.mut
+ total$dPSI.Dupuis.ko <- dPSI.Dupuis.ko
+ 
+ total$dPSI.Fratta.mut <-dPSI.Fratta.mut 
+ total$dPSI.Fratta.ko <- dPSI.Fratta.ko
+ 
+ 
+ total$featureID <- fID
+ total <- dplyr::select(total, featureID, everything())
+ 
+ return(total)
+}
+
+introns <- filter(res.clean, status_relaxed == "Overlapping" | coords =="chr7:127974434-127975888", type == "RI" )
+
+
+introns_psi <- map_df( introns$featureID, deltaPSItable)
+
+introns_psi$featureID <- introns$featureID
+introns <- left_join(introns, introns_psi, by = "featureID")
+
+# plot the different dPSIs for RNA-binding protein genes
+
+
+prepare_psi <-
+  introns %>%
+ # filter(status_relaxed == "Overlapping" | coords == "chr7:127974434-127975888") %>%
+  filter(geneName %in% rna_gene_ids) %>%
+  #head(100) %>%
+  #filter(gene %in% c("Fus", "Ewsr1", "Taf15", "Snrnp70")) %>%
+  mutate(gene = paste0(gene," ",coords)) %>%
+  select(featureID, gene, contains("dPSI")) %>%
+  #head()
+  #select(-featureID) %>%
+  select(-featureID, -dPSI.ko, -dPSI.mut) %>%
+  tidyr::gather(key = "comparison", value = "dPSI", -gene) %>%
+  mutate(comparison = gsub("dPSI.", "", comparison)) %>%
+  mutate(comparison = gsub(".mut", "\nMUT", comparison )) %>%
+  mutate(comparison = gsub(".ko", "\nKO", comparison)) %>%
+  mutate(comparison = factor(comparison,
+                             levels =
+                               c("Bozzoni\nMUT", "Dupuis\nMUT", "Fratta\nMUT",
+                                 "Bozzoni\nKO", "Dupuis\nKO", "Fratta\nKO")) )
+# plot the two FUS introns at the top
+all_genes <- unique(prepare_psi$gene)
+all_genes <- all_genes[ order(all_genes)]
+gene_levels <- rev(c(all_genes[grepl("Fus", all_genes)], all_genes[ !grepl("Fus", all_genes)] ))
+
+psi_heatmap <- 
+  prepare_psi %>%
+  mutate(gene = factor(gene, 
+                       levels = gene_levels )
+         ) %>%
+  ggplot(aes(y = gene, x = comparison)) +
+  geom_tile( aes(fill = dPSI)) +
+  #scale_fill_distiller(type = "div", na.value = "white", palette = "RdBu") +
+  scale_fill_gradient2(
+    low = "blue", high = "red",
+    #low = scales::muted("red"), 
+    mid = "white",
+    #high = scales::muted("blue"), 
+    midpoint = 0, space = "Lab",
+    na.value = "grey50", guide = "colourbar", aesthetics = "fill"
+  ) +
+  xlab("") +
+  ylab("") +
+  #geom_text(aes(label = signif(dPSI, digits=2) ), size = 2) +
+  scale_y_discrete( expand = c(0, 0)) +
+  scale_x_discrete(expand = c(0,0),position = "top") +
+  theme(axis.text.x.top = element_text(angle = 270,vjust =0.66),
+        axis.text = element_text(colour = "black"),
+        axis.ticks = element_blank(),
+        legend.position="bottom",
+        legend.justification = "center")
+  
+ggsave(filename = "figures/splicing/PSI_heatmap_RBP_introns.pdf", plot = psi_heatmap,
+       width = 4, height = 8, device = cairo_pdf)
+
+
+```
+
+# Overlap with Raphaelle's set of retained introns in VCP
+```{r}
+raphaelle_intron_file <- "data/Luisier_VCP/IR_events_NatureComm_paper.xlsx"
+raphaelle_all <- readxl::read_xlsx(raphaelle_intron_file, sheet = 1)
+raphaelle_fus <- readxl::read_xlsx(raphaelle_intron_file, sheet = 2)
+
+# raphaelle_all 
+#all 167 introns in 143 genes found to be changed during differentiation of VCP mutant neurons compared to Wildtype
+# raphaelle_fus 
+# those that are also found in FUS mutants 
+
+# fix SEPT2 - mangled by Excel
+raphaelle_all[ raphaelle_all$COORD == "chr2:242276932-242277087", "GENE"] <- "SEPT2"
+raphaelle_fus[ raphaelle_fus$COORD == "chr2:242276932-242277087", "GENE"] <- "SEPT2"
+
+## -----  fix gene names
+
+all_raph_genes <- unique(raphaelle_all$GENE)
+
+length(unique(raphaelle_all$GENE))
+
+# first try title case conversion 
+all_raph_title <- str_to_title(all_raph_genes)
+
+# if converted they will be in res.clean
+converted_genes <- all_raph_title[ all_raph_title %in% res.clean$gene ]
+
+holdouts <- all_raph_genes[ ! all_raph_title %in% res.clean$gene ]
+
+holdouts <- unique(holdouts)
+names(holdouts) <- holdouts
+holdouts["AGPAT6"] <- "Gpat4"
+holdouts["HNRPDL"] <- "Hnrnpdl"
+holdouts["KLHDC5"] <- "Klhl42"
+holdouts["CPSF3L"] <- "Ints11"
+holdouts["FKBP10"] <- "Fkbp10"
+holdouts["KIAA0368"] <- "AI314180" # should be ecpas - must be my annotation out of date
+holdouts["MLLT4"] <- "Afdn"
+holdouts["PPAPDC1B"] <- "Plpp5"
+holdouts["EIF2C4"] <- "Ago4"
+holdouts["KIAA0146"] <- "Spidr"
+holdouts["FAM40A"] <- "Strip1"
+holdouts["TH1L"] <- "Nelfcd"
+holdouts["METT11D1"] <- "Mettl17"
+holdouts["C9orf5"] <- "Tmem245"
+holdouts["SMEK1"] <- "Ppp4r3a"
+holdouts["C19orf61"] <- "Smg9"
+holdouts["KIAA0528"] <- "C2cd5"
+holdouts["SR140"] <- "U2surp"
+holdouts["ARPC2"] <- "Arpc2"
+holdouts["EMD"] <- "Emd"
+holdouts["HPRT1"] <- "Hprt"
+holdouts["MOV10"] <- "Mov10"
+holdouts["CHD1L"] <- "Chd1l"
+
+table(holdouts %in% res.clean$gene)
+
+converted_genes <- c(converted_genes, holdouts)
+
+length(unique(converted_genes))
+
+table(converted_genes %in% res.clean$gene)
+
+
+# now I have 143 genes, of which 8 can't be found in res.clean
+
+
+raphaelle_all_go <- gprofiler(converted_genes, 
+                              organism = "mmusculus",
+                              min_set_size = 5, 
+                              src_filter = c("GO", "KEGG", "REAC", "CORUM"),
+                              hier_filtering = "strong")
+
+# 33 out of 197 have "RNA binding" GO term - P=4e-10
+
+# how many overlap with my FUS retained introns?
+# comparing human and mouse genes - naive way is to shift human genes to title case
+#raphaelle_fus_mouse <- convertHumanGeneList(raphaelle_fus$GENE)
+
+
+# how many of these genes have significant splicing events?
+res_raph <- filter(res.clean, 
+                   status_relaxed != "None",
+                   gene %in% intersect(res.clean$gene, converted_genes)
+                   ) 
+length(unique(res_raph$gene))
+
+
+# 17 out of 119 possible genes have splicing events that change in FUS
+
+# how significant is this? Make table of all genes
+all_genes <- tibble(gene = unique(res.clean$gene)) 
+
+all_genes$sig_fus <- all_genes$gene %in% filter(res.clean, status_relaxed != "None")$gene
+
+# compare to only retained introns and complex events
+ri_complex <- filter(res.clean, 
+                     status_relaxed != "None", 
+                     type %in% c("COMPLEX","RI"), 
+                     status_relaxed == "Overlapping" )
+
+all_genes$sig_fus_ri_complex <- all_genes$gene %in% ri_complex$gene
+
+
+ri_only <- filter(res.clean, 
+                     status_relaxed != "None", 
+                     type %in% c("RI"), 
+                     status_relaxed == "Overlapping" )
+
+all_genes$sig_fus_ri <- all_genes$gene %in% ri_only$gene
+
+
+all_genes$sig_raphaelle <- all_genes$gene %in% converted_genes
+
+# make two by two table
+
+# first comparing to all splicing events found significant
+raph_fus_table <- table(fus = all_genes$sig_fus, raph = all_genes$sig_raphaelle)
+
+raph_fus_table
+fisher.test(raph_fus_table)
+
+
+# restrict to just complex and RI events
+raph_fus_ri_complex_table <- 
+  table(fus = all_genes$sig_fus_ri_complex, raph = all_genes$sig_raphaelle)
+
+raph_fus_ri_complex_table
+fisher.test(raph_fus_ri_complex_table)
+
+# just RI
+raph_fus_ri_table <- 
+  table(fus = all_genes$sig_fus_ri, raph = all_genes$sig_raphaelle)
+
+raph_fus_ri_table
+fisher.test(raph_fus_ri_table)
+
+# even better! but stick to complex and ri as both have iCLIP signal and RNA binding signal
+
+
+
+
+library(VennDiagram)
+library(ggplotify)
+
+venn_plot <- 
+  as.ggplot(
+    ~draw.pairwise.venn(
+  area1 = sum(all_genes$sig_fus_ri_complex),
+  area2 = sum(all_genes$sig_raphaelle),
+  cross.area = sum( all_genes$sig_fus_ri_complex & all_genes$sig_raphaelle),
+  category = c(
+    "Retained introns and complex events\nfound in this study", 
+    "Retained introns found\n by Luisier et al"
+    )
+  ) 
+)
+
+ggsave(plot = venn_plot,filename = "figures/splicing/Luisier_overlap.pdf")
+
+
+# print table of genes where they overlap
+
+luisier_overlap_table <- 
+  filter(ri_complex, gene %in% converted_genes) %>%
+  dplyr::select( gene, coords, event.length, type, iclip.distance, phyloP ) %>%
+  arrange(gene)
+
+stargazer::stargazer(luisier_overlap_table, summary = FALSE)
+```
+
+
+
+
+
+# Overlap between FUS-regulated introns and nuclear retention
+
+```{r}
+# Data from Halpern et al - Nuclear Retention of mRNA in Mammalian Tissues
+
+halpern <- read_tsv("data/SGSeq/Halpern_fractionation/halpern_liver_liver_nuc_liver_cyt_splice_variant_table_sig.tab")
+
+ggplot(halpern, aes(x = control_PSI)) +
+  geom_density(aes(fill = variant_type)) +
+  facet_wrap(~variant_type)
+
+table(halpern$variant_type)
+
+filter(halpern, gene == "Fus")
+
+halpern_ri <- filter(halpern, variant_type == "retained_intron")
+dim(halpern_ri)
+length(unique(halpern_ri$gene))
+# 3033 events in 1813 genes
+hist(halpern_ri$control_PSI)
+
+ggplot(halpern_ri, aes(x = dPSI, y = -log10(FDR))) + geom_point(aes(colour = control_PSI < 0.05))
+
+# get the top 100 candidates where:
+# control_PSI < 0.05
+# dPSI > 0.20
+# rank by FDR
+strict_ri <- 
+  halpern_ri %>%
+  filter(control_PSI <= 0.1, dPSI > 0.2) %>%
+  arrange(FDR) 
+
+strict_ri_go <- gprofiler(strict_ri$EnsemblID,
+                        organism = "mmusculus",
+                        src_filter = c("GO", "KEGG", "REAC", "CORUM"),
+                        hier_filtering = "strong")
+
+rna_binding <- filter(strict_ri_go, term.name == "RNA binding")$intersection
+
+rna_binding_genes <- (str_split(rna_binding, pattern =",")[[1]])
+
+strict_ri$rna_binding <- strict_ri$EnsemblID %in% rna_binding_genes
+
+# ri - all retained introns found in overlapping splicing events
+ri$halpern <- ri$gene %in% strict_ri$gene
+
+# test - what is the overlap between retained introns in FUS and nuclear detained introns in Halpern?
+
+
+table(ri$halpern, ri$rna_binding)
+
+ggplot(strict_ri, aes(x = control_PSI, y = dPSI)) + geom_point(aes(colour = rna_binding)) +
+  facet_wrap(~rna_binding)
+
+```
+

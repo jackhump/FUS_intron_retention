@@ -1,0 +1,1126 @@
+---
+title: "SGSeq - joint analysis II - novel events"
+author: "Jack Humphrey"
+date: "24/04/2018"
+output: 
+  html_document:
+    code_folding: hide
+    fig_width: 9
+    df_print: paged
+    theme: cerulean
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "~/google_drive/Work/PhD_Year_4/FUS_meta-analysis/")
+library(SGSeq)
+library(DEXSeq)
+library(purrr)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(stringr)
+library(UpSetR)
+library(readr)
+library(gProfileR)
+library(plotly)
+library(patchwork)
+library(ggrepel)
+library(ggbeeswarm)
+```
+
+
+
+```{r, cache = TRUE}
+
+# Functions
+
+# convert SGSeq coord columns to an IGV-friendly coordinate range
+createCoords <- function(from, to){
+  fromSplit <- str_split_fixed(from, ":", 4)
+  toSplit <- str_split_fixed(to, ":", 4)
+  coord <- ifelse( toSplit[,4] == "+", 
+                   yes = paste0( toSplit[,2], ":", fromSplit[,3], "-", toSplit[,3]),
+                   no = paste0( toSplit[,2], ":", toSplit[,3], "-", fromSplit[,3]) 
+  ) 
+}
+# get strand from SGSeq from and to columns
+getStrand <- function(from, to){
+  fromSplit <- str_split_fixed(from, ":", 4)
+  toSplit <- str_split_fixed(to, ":", 4)
+  s1 <- fromSplit[,4]
+  s2 <- toSplit[,4]
+  strand <- case_when(
+    s1 == "+" & s2 == "+" ~ "+",
+    s1 == "-" & s2 == "-" ~ "-", 
+    s1 != s2 ~ "*"
+  )
+  return(strand)
+}
+
+cleanResults <- function(Rdata){
+  load(Rdata)
+  # Rdata file should contain meta and res
+  if(! exists("meta", inherits = FALSE) ){
+    meta <- mcols(sgvc)
+    res <- results(DexSeqExons.loc)
+    res$groupID <- str_split_fixed(row.names(res), pattern = ":", n = 2)[,1]
+    res$featureID <- str_split_fixed(row.names(res), pattern = ":", n = 2)[,2]
+  }
+  meta_df <- 
+    as.data.frame(meta) %>%
+    dplyr::select(-featureID) %>%
+    dplyr::rename(featureID = variantID, groupID = eventID) %>%
+    mutate( featureID = as.character(featureID),
+            groupID = as.character(groupID))
+  
+  res.clean <- 
+    as.data.frame(res) %>%
+    mutate( featureID = as.character(featureID), # stupid type conversion joining errors
+            groupID = as.character(groupID) )  %>%
+    left_join(x = ., y = meta_df, by = c("groupID", "featureID")) %>%
+    dplyr::select(-starts_with("countData") ) %>%
+    mutate(gene = biomart$gene_name[ match(.$geneName, biomart$EnsemblID)] ) %>%
+    mutate(coords = createCoords( from = .$from, to = .$to) ) %>%
+    mutate(strand = getStrand( from = .$from, to = .$to)) %>%
+    dplyr::select( -from, -to) %>%
+    dplyr::select(gene, coords, padj, starts_with("log2fold"), everything() )
+  
+  # add cleaned up variant type - any events with multiple categories are renamed "complex"
+  # and given direction
+  res.clean$type <- 
+    map_chr( res.clean$variantType, ~{
+      if( length(.x) == 1){ 
+        .x
+      }else{
+        case_when( 
+          any(.x %in% c("SE:I", "RI:R")) ~ "COMPLEX:U",
+          any(.x %in% c("SE:S", "RI:E")) ~ "COMPLEX:D",
+          all(!.x %in% c("SE:S", "RI:E", "SE:I", "RI:R") ) ~ "COMPLEX:NA" 
+        )
+      }
+    })
+  
+  # select just the up-going variants
+  allowed_types <- c(
+  "SE:I","RI:R","COMPLEX:U","A5SS:P", "A3SS:P","ALE","AFE","AS","AE","MXE","S2E:I"
+  )
+
+  res.clean <- filter( res.clean, type %in%  allowed_types)
+  
+  # rename the variants by chopping off the :
+  res.clean$type <- gsub(":.*", "", res.clean$type )
+  
+  return(res.clean)
+  
+}
+
+loadSGVC <- function(RData){
+  load(RData)
+  return(sgvc)
+}
+
+# PSI creation
+createPSI <- function(sgvc, res.sig, support){
+  
+  all_counts <- as.data.frame(counts(sgvc))
+  all_counts$vid <- mcols(sgvc)$variantID
+  all_counts$eid <- mcols(sgvc)$eventID
+  
+  hitcounts <- filter(all_counts, vid %in% res.sig$featureID)
+  # for each event ID,
+  # split by effect ID (shared) and divide each column by the column sum to get PSI
+  psi <- 
+    split(hitcounts, hitcounts$eid) %>%
+    map_df( ~{
+      sweep( .x, MARGIN = 2, STATS = colSums(.x), FUN = "/")
+    })
+  
+  # add back the variant and effect IDs
+  psi_df <-
+    psi %>%
+    mutate(featureID = as.character(hitcounts$vid),
+           groupID = hitcounts$eid) %>%
+    dplyr::select(featureID, groupID, everything() ) %>%
+    dplyr::select( -vid, -eid) %>%
+    tidyr::gather( "sample_name", "PSI", -featureID, -groupID ) %>%
+    left_join(x = ., y = support, by = "sample_name") %>%
+    left_join(x = ., y = res.sig, by = "featureID")
+  
+  return(psi_df)
+}
+
+
+psiPlot <- function(id, psi_df){
+  df <- filter(psi_df, featureID == as.character(id) ) %>%
+    dplyr::select(PSI, dataset, condition, gene, type)
+  df <- df[ complete.cases(df),]
+  p <- ggplot( df, aes( x = condition, y = PSI, colour = dataset )) +
+    geom_jitter(width = 0.2, height = 0) +
+    #geom_point() +
+    theme_bw() +
+    #ylim(c(0,1)) +
+    facet_wrap(~dataset, ncol = 3, scale = "free") +
+    labs(title = paste(id, df$gene, df$type) ) +
+    guides(colour = FALSE)
+  return(p)
+}
+
+
+
+
+
+
+
+```
+
+
+```{r, warning=FALSE, message = FALSE}
+
+support <- read_tsv("data/SGSeq/joint_analysis/novel_events/joint_SGSeq_novel_support_no_HET.tab")
+
+# load biomart mouse
+biomart <- readr::read_tsv("misc/biomart_annotations_mouse.txt")
+
+```
+
+
+Load results of joint and individual analyses
+
+```{r, cache = TRUE}
+# load in and clean results
+# results_all <- "data/SGSeq/joint_analysis/novel_events/all_samples_joint_SGSeq_analysis_novel.Rdata"
+# 
+# res.clean <- cleanResults(results_all)
+# 
+# sgvc <- loadSGVC(results_all)
+# 
+# sig <-
+#   filter(res.clean, padj  < 0.05) %>%
+#   dplyr::select( gene,coords, type, everything() ) %>%
+#   arrange(padj)
+# 
+# 
+# psi_df <- createPSI( sgvc, res.sig =  sig, support )
+# 
+
+
+```
+
+```{r}
+# 
+# I ran SGSeq on its novel splicing discovery mode on 44 samples simultaneously. This produced a count matrix of 73686 splicing variants comprised of 165651 splice junctions. I than ran DEXSeq on each splicing variant, estimating the dispersion for each splice variant across all samples and fitting two models:
+# 
+# 1. formulaFullModel = ~ sample + exon + dataset:exon + condition:exon
+# 2. formulaReducedModel = ~ sample + exon + dataset:exon
+# 
+# Where dataset is a discrete covariate, one of { Bozzoni, Dupuis, Nicol } to account for differences in cell type and RNA-seq preparation between the 3 different labs.
+# 
+# 
+# How many splicig events do I find at FDR < 0.05 and what is their breakdown by category?
+# 
+# ```{r}
+# table(res.clean$padj < 0.05)
+# ```
+# 
+# 
+# ```{r}
+# var_defs <- tribble(
+# ~type, ~definition,
+# "SE",  "skipped exon",
+# "S2E", "two consecutive exons skipped",
+# "RI", " retained intron",
+# "MXE", "mutually exclusive exons",
+# "A5SS",    "alternative 5' splice site",
+# "A3SS",     "alternative 3' splice site",
+# "AFE",       "alternative first exon",
+# "ALE",       "alternative last exon",
+# "AS",        "alternative start other than AFE",
+# "AE", " alternative end other than ALE",
+# "COMPLEX", "variant comprised of more than one type"
+# )
+# 
+# knitr::kable( var_defs)
+# 
+# 
+# type_count <- 
+#   res.clean %>%
+#   filter(padj < 0.05) %>%
+#   group_by(type) %>%
+#   summarise( n = n() ) %>% 
+#   arrange(desc(n) ) %>%
+#  rbind(.,
+#       tibble( type = "Total", n = sum(.$n) )
+#     ) 
+# 
+# knitr::kable(type_count)
+# 
+# ```
+# 
+# Complex splicing variants now dominate the totals. SGSeq has had free reign to use all splice junctions it can find and so will classify each event as best it can. How many and what kind of classifications come in up in complex events?
+# 
+```
+
+```{r}
+# complexes <- filter(res.clean, padj < 0.05, type == "COMPLEX" )$variantType
+# 
+# # how many categories can be found?
+# 
+# map_int(complexes, length) %>%
+#   tibble( Categories = . ) %>%
+#   group_by( Categories) %>%
+#   summarise( n = n() ) %>%
+#   knitr::kable()
+# 
+# ```
+# 
+# 
+# What types of splicing variants co-occur in complex events?
+# 
+# 
+# # ```{r}
+# all_var_types <- unlist(complexes) %>% unique()
+# 
+# # loop through each complex and record what events are there
+# co_oc <-
+#   map( all_var_types,
+#      ~{
+#        category = .x
+#       as.character(which(map_chr(complexes, ~{ category %in% .x}) == TRUE))
+#        } )
+# 
+# names(co_oc) <- all_var_types
+# 
+# upset( data =  fromList(co_oc), nsets = length(co_oc), keep.order = TRUE, order.by = "freq")
+# 
+# ```
+# 
+# Complex events turn out to be incredibly complex but are usually made of a retained intron with either an alternate splice site or cassette exon or both. All variants in a complex event to go in the same direction. This has allowed me to infer an overall direction.
+# 
+# ## trimming variants
+# 
+# For most variant types SGSeq calculates a log2fold change and p value for the inclusion and exclusion version separately. The inclusion variants usually have lower p values due to more reads being available to prove inclusion of something than reduction of something. This confuses things. For simplicity I have just kept the up-going versions. 
+# 
+# ## Comparing the two conditions
+# 
+# DEXSeq estimates two fold changes, one for control vs FUS KO and another for control vs FUS MUT.
+# What is the relationship between the two?
+# 
+# ### Scatter plot 
+# 
+# plotly enabled so hover over points to get gene and fold change information.
+# 
+# ```{r}
+# 
+# p <- res.clean %>%
+#   filter(padj < 0.05) %>%
+#   ggplot(
+#     aes(x = log2fold_FUS_KO_CTL, 
+#         y = log2fold_FUS_MUT_CTL
+#         )
+#     ) +
+#     geom_point(alpha = 0.75, aes(colour = type, 
+#         #size = -log10(padj), 
+#         label = gene )) +
+#     #geom_text(size = 3) +
+#     geom_hline(yintercept = 0, linetype = 3) +
+#     geom_vline(xintercept = 0, linetype = 3) +
+#     geom_abline(slope =1 , intercept = 0, linetype = 3) +
+#     theme_bw() +
+#     xlim(-5,5) + 
+#     ylim(-5,5) + 
+#   geom_smooth(colour = "black", method = "lm")
+# 
+# p
+# ggplotly(p)
+# 
+# ```
+# 
+# ### Density plots
+# 
+# What is the distribution of fold changes? How much do they differ between the two conditions?
+# 
+# ```{r}
+# sig <- filter(res.clean, padj < 0.05)
+# ggplot() + 
+#   geom_density(data = sig, aes(x = log2fold_FUS_KO_CTL ), fill = "blue", alpha = 0.5) + 
+#   geom_density(data = sig, aes(x = log2fold_FUS_MUT_CTL), fill = "red", alpha = 0.5) +
+#   theme_bw() +
+#   xlab("fold change") + 
+#   xlim(-4,4) + 
+#   labs(caption = "blue: FUS KO; red: FUS MUT")
+# 
+# ```
+# 
+# ## Difference testing:
+# 
+# ```{r}
+# cor.test(x = sig$log2fold_FUS_KO_CTL, y = sig$log2fold_FUS_MUT_CTL)
+# 
+# summary( lm( log2fold_FUS_KO_CTL ~ log2fold_FUS_MUT_CTL, data = sig))
+# 
+# wilcox.test( x = sig$log2fold_FUS_MUT_CTL, y = sig$log2fold_FUS_KO_CTL, paired = TRUE )
+# 
+# t.test( x = sig$log2fold_FUS_MUT_CTL, y = sig$log2fold_FUS_KO_CTL, paired = TRUE )
+# ```
+# 
+# 
+# The two strongly correlate (cor = 0.712; p < 1e-16) with a slope suggesting slightly stronger fold changes for FUS KO than FUS MUT (regression beta log2FC KO ~ 0.962 * log2FC MUT; p < 1e-16).
+# 
+# Comparing the distribution of all fold changes shows that the FUS MUT has a much narrower distribution of values than FUS KO.
+# 
+# 
+# ## Splitting by variant type
+# 
+# 
+# ```{r, fig.align = "center"}
+# 
+# # create labels for facet plots
+# type_labels <- paste0(type_count$type, " (n=",type_count$n, ")")
+# names(type_labels) <- type_count$type 
+# 
+# # plot the fold changes against each other - what are the distributions for each variant type?
+# sig %>%
+# ggplot(
+#   aes(x = log2fold_FUS_KO_CTL,
+#       y = log2fold_FUS_MUT_CTL,
+#       colour = type, 
+#       #size = -log10(padj),
+#       label = gene )) +
+#   geom_point(alpha = 0.25) +
+#   #geom_smooth(method = "lm", alpha = 0.5) +
+#   #geom_text(size = 1) +
+#   geom_hline(yintercept = 0, linetype = 3) +
+#   geom_vline(xintercept = 0, linetype = 3) +
+#   geom_abline(slope =1 , intercept = 0, linetype = 3) +
+#   theme_bw() +
+#   facet_wrap(~type, labeller = labeller(type = type_labels), scale = "free") +
+#   guides(colour=FALSE) +
+#   theme(strip.background = element_rect(colour="black", fill="white") )
+# 
+# # compare log2fold changes for each variant type
+# paired_wilcox <- split(sig, sig$type) %>%
+#   map_df( ~{
+#     x <- .x$log2fold_FUS_KO_CTL
+#     y <- .x$log2fold_FUS_MUT_CTL
+#     
+#     t <- wilcox.test(x,y, paired=TRUE)
+#     return( tibble(p = signif(t$p.value, digits = 3) ) )
+#   }, .id = "type")
+# 
+# 
+# # as density plots - lighter is MUT, darker is KO
+# 
+# ggplot(sig,aes(fill = type )) +
+#   geom_density( aes(x = log2fold_FUS_KO_CTL) ) +
+#   geom_density( aes(x = log2fold_FUS_MUT_CTL), alpha = 0.2 ) +
+#  # geom_hline(yintercept = 0, linetype = 3) +
+#   geom_vline(xintercept = 0, linetype = 3) +
+#   #geom_abline(slope =1 , intercept = 0, linetype = 3) +
+#   theme_bw() +
+#   facet_wrap(~type, labeller = labeller(type = type_labels), scale = "free") +
+#   geom_text( data = paired_wilcox, aes(x = 1, y = 1.5, label = p)) +
+#   guides(fill=FALSE) +
+#   xlab("log2 fold change") +
+#   xlim(-2,2) +
+#   ylim(0,2) +
+#   labs( caption = "lighter: FUS MUT; darker: FUS KO\nP values from paired Wilcoxon test to compare distributions") +
+#   theme(
+#     #strip.text = element_text( face = "bold"),
+#     strip.background = element_rect(colour="black", fill="white") )
+# 
+# ```
+
+# Dealing with the conditions separately
+
+
+#The main problem is that DEXSeq tries to fit a log2foldChange for each comparison even when there is no evidence of a change in that comparison. 
+#So instead I ran DEXSEq on the FUS MUT and FUS KO separately.
+```
+
+# Running DEXSeq separately to compare
+
+```{r cache = TRUE}
+
+results_KO <- "data/SGSeq/joint_analysis/novel_events/FUS_KO_novel_SGSeq.Rdata"
+results_MUT <- "data/SGSeq/joint_analysis/novel_events/FUS_MUT_novel_SGSeq.Rdata"
+
+ko.clean <- cleanResults(results_KO)
+mut.clean <- cleanResults(results_MUT)
+```
+
+
+
+```{r}
+map_df( list(KO = ko.clean, MUT = mut.clean), ~{
+  dplyr::filter(.x, padj < 0.05 & !is.na(padj) ) %>% 
+  dplyr::count() %>% 
+  dplyr::select( "FDR < 0.05" = n)
+  }, .id = "comparison" )
+
+# overlap between KO and MUT?
+ko_sig <- filter(ko.clean, padj < 0.05)$featureID 
+mut_sig <- filter(mut.clean, padj < 0.05)$featureID
+
+length(intersect(ko_sig, mut_sig))
+
+```
+
+I now see fewer hits in total than I did for the joint analysis - a loss of power.  I see very few hits now in the FUS MUT comparisons. 
+
+## Looking for shared splicing events
+
+```{r}
+
+combined <- 
+  purrr::reduce(
+    list(
+      ko = ko.clean %>% 
+       dplyr::select(featureID, groupID, gene_name = gene, coords, strand, type,
+                     lfc_ko = log2fold_FUS_KO_CTL, 
+                     P_ko = pvalue, FDR_ko = padj,
+                     baseMean_ko = exonBaseMean),
+      mut = mut.clean %>% 
+       dplyr::select(featureID, groupID, gene_name = gene, coords, strand, type, 
+                     lfc_mut = log2fold_FUS_MUT_CTL, 
+                     P_mut = pvalue, FDR_mut = padj,
+                     baseMean_mut = exonBaseMean)
+    ),
+    left_join,
+    by = c("featureID", "groupID", "gene_name", "type", "coords","strand")
+)
+
+combined$ensemblID <- ko.clean$geneName[ match(combined$featureID, ko.clean$featureID)]
+
+combined$ensemblID <- map_chr(combined$ensemblID, ~paste(.x, collapse = "+") )
+combined <- select(combined, ensemblID, everything())
+
+# classify events by overlap
+combined <- combined %>%
+  mutate( status_strict = case_when(
+    FDR_mut < 0.05 & FDR_ko < 0.05 ~ "Overlapping",
+    FDR_mut < 0.05 & (FDR_ko >= 0.05 | is.na(FDR_ko) ) ~ "Mutation specific",
+    (FDR_mut >= 0.05 | is.na(FDR_mut) ) & FDR_ko < 0.05 ~ "Knockout specific",
+    TRUE ~ "None"
+    
+  )) 
+
+table(combined$status_strict)
+
+combined <- 
+  mutate(combined, 
+  status_relaxed = case_when(
+    (FDR_ko < 0.05 & P_mut < 0.05 | FDR_mut < 0.05 & P_ko < 0.05) ~ "Overlapping",
+    (FDR_ko < 0.05 & P_mut > 0.05) ~ "Knockout specific",
+    (FDR_mut < 0.05 & P_ko > 0.05) ~ "Mutation specific",
+    TRUE ~ "None"
+  )
+  )
+table(combined$status_strict)
+table(combined$status_relaxed)
+
+write_tsv(combined, path = "results/03_SGSeq/combined_sgseq_joint_splicing_total.tsv")
+
+# save combined table of all significant splicing events
+combined.sig <- 
+  combined %>%
+  filter( status_relaxed != "None")
+
+write_tsv(combined.sig, path = "results/03_SGSeq/combined_sgseq_joint_splicing_sig.tsv")
+
+# for supplementary table take out feature and groupIDs
+combined.sig.table <-
+  combined.sig %>%
+  select(-featureID, -groupID) %>%
+  rename("coords_mm10" = "coords")
+
+write_tsv(combined.sig.table, path = "tables/combined_sgseq_joint_splicing_sig_table.tsv")
+
+# test import
+df <- read_tsv("tables/combined_sgseq_joint_splicing_sig_table.tsv")
+
+# plots
+
+ggplot(combined, aes(x = log10(baseMean_ko) )) + 
+  geom_density(aes(fill=status_strict), alpha = 0.5) +
+ggplot(combined, aes(x = log10(baseMean_mut))) +
+  geom_density(aes(fill=status_strict), alpha = 0.5) +
+  plot_layout(nrow=2)
+
+```
+
+```{r}
+main_plot_cols <- c("Fus" = "red",
+                    #"Taf15" = "blue",
+                    "Ewsr1" = "orange",
+                    #"Mapt" = "yellow",
+                    #"Hnrnpa1" = "pink",
+                    "Nrxn3" = "green",
+                    "Ybx1" = "yellow")
+
+to_plot <- 
+  filter(combined, status_relaxed != "None" ) %>%
+  arrange(FDR_ko)
+  #mutate( status = factor(status, levels = c("Knockout specific", "Overlapping", "Mutation specific")))
+
+key_genes <- 
+  filter(to_plot, gene_name %in% c("Fus", "Ybx1", "Ewsr1", "Nrxn3"), status_relaxed == "Overlapping" )
+
+scatter_strict <- 
+  to_plot %>%
+  filter( status_strict == "Overlapping") %>%
+  ggplot(aes( x = lfc_ko, y = lfc_mut)) + 
+  geom_point(aes(colour = status_strict), alpha = 0.5, size = 0.75) +
+  theme_bw() +
+  xlab( expression( log[2]~fold~change~knockouts)  ) +
+  ylab(  expression( log[2]~fold~change~knockouts) ) +
+  scale_colour_manual(values = main_plot_cols) +
+  geom_smooth(data = filter(combined, status_strict == "Overlapping"),
+              aes(x = lfc_ko, y = lfc_mut), method = "lm") +
+  geom_abline(slope = 1, intercept = 0, linetype = 3) +
+  geom_point( data = key_genes, aes( x = lfc_ko, y =lfc_mut, colour = status_strict)) +
+  geom_text_repel(data = key_genes,
+                                aes( x = lfc_ko, y = lfc_mut, label = gene_name),force = 25, fontface = "italic") + 
+  #geom_point( data = key_genes, aes( x = lfc_ko, y =lfc_mut), colour = "black") +
+  #geom_text_repel(data = key_genes,
+  #                              aes( x = lfc_ko, y = lfc_mut, label = gene_name),force = 1000, fontface = "italic") + 
+  facet_wrap(~status_strict, ncol = 3) +
+  guides(colour = FALSE) +
+  theme(strip.background = element_rect(colour="black", fill="white") )
+
+overlapping <- filter( combined, status_relaxed == "Overlapping")
+
+mod <- lm( lfc_mut ~ lfc_ko, data = overlapping)
+summary(mod)
+
+scatter_relaxed <- 
+  to_plot %>%
+  filter(!is.na(status_relaxed)) %>%
+  filter(status_relaxed == "Overlapping") %>%
+  ggplot(aes( x = lfc_ko, y = lfc_mut,  label = gene_name)) + 
+  geom_point(colour = "purple", alpha = 0.5, size = 0.75) +
+  theme_bw() +
+  xlab( expression( log[2]~fold~change~knockouts)  ) +
+  ylab(  expression( log[2]~fold~change~knockouts) ) +
+  scale_colour_manual(values = main_plot_cols) +
+  geom_smooth(data = filter(combined, status_relaxed == "Overlapping"),
+              aes(x = lfc_ko, y = lfc_mut), method = "lm") +
+  geom_text_repel(data = key_genes,
+                                aes( x = lfc_ko, y = lfc_mut, label = gene_name),force = 25, fontface = "italic") + 
+  geom_point( data = key_genes, aes( x = lfc_ko, y =lfc_mut, colour = gene_name) ) +
+  geom_abline(slope = 1, intercept = 0, linetype = 3) +
+  #geom_point( data = key_genes, aes( x = lfc_ko, y =lfc_mut), colour = "black") +
+  #geom_text_repel(data = key_genes,
+  #                              aes( x = lfc_ko, y = lfc_mut, label = gene_name),force = 1000, fontface = "italic") + 
+  #facet_wrap(~status_strict, ncol = 3) +
+  #guides(colour = FALSE) +
+  theme(strip.background = element_rect(colour="black", fill="white"),
+        panel.grid = element_blank()) +
+  theme(strip.background = element_rect(colour="black", fill="white"),
+        panel.grid = element_blank()
+        ) +
+  geom_hline(yintercept = 0, linetype = 3, colour = "darkgrey") +
+  geom_vline(xintercept = 0, linetype = 3, colour = "darkgrey") +
+  labs(caption = expression(beta*"=0.70; P=1e-16")) +
+  xlim(-3,3) + ylim(-3,3)
+
+scatter_relaxed
+ggsave(plot = scatter_relaxed, filename = "figures/splicing/scatter_relaxed.pdf")
+
+
+```
+
+```{r venn}
+# --------- venn diagram
+
+library(VennDiagram)
+library(ggplotify)
+
+ko_sig <- filter(ko.clean, padj < 0.05)$featureID 
+mut_sig <- filter(mut.clean, padj < 0.05)$featureID
+overlap_strict <- length(intersect(ko_sig, mut_sig))
+
+
+venn_strict <- 
+  as.ggplot(
+    ~draw.pairwise.venn(
+      area1 = length(ko_sig), 
+      area2 = length(mut_sig), 
+      cross.area = overlap_strict, 
+     # category = c("knockouts", "mutants"), 
+      fill = c("red","blue"),
+      alpha = 0.5,
+      cat.cex = c(1,1),
+      cat.fontfamily = "sans", 
+      cat.pos = 360,
+      cat.dist = c(0.1,0.1))
+      ) +
+  labs(title = "i) overlap = q < 0.05 in both") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+overlap_relaxed <- nrow(filter(combined, status_relaxed == "Overlapping"))
+
+venn_relaxed <- 
+  as.ggplot(
+    ~draw.pairwise.venn(
+      area1 = nrow( filter(combined, status_relaxed %in% c("Knockout specific", "Overlapping" ) ) ) , 
+      area2 = nrow( filter(combined, status_relaxed  %in% c("Mutation specific", "Overlapping" ))) , 
+      cross.area = overlap_relaxed,
+      #category = c("knockouts", "mutants"), 
+      fill = c("red","blue"),
+      alpha = 0.5,
+      cat.cex = c(1,1),
+      cat.fontfamily = "sans", 
+      cat.pos = 360,
+      cat.dist = c(0.1,0.1))
+  )  +
+  labs(title = "ii) overlap = q < 0.05 in one and P < 0.05 in the other") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+venn_multi <- 
+  venn_strict + venn_relaxed + plot_layout(nrow = 2) + plot_annotation(caption = "red: knockouts, blue: mutants")
+
+venn_multi
+
+ggsave(plot = venn_multi, filename = "figures/splicing/venn_overlaps.pdf", width = 7, height = 4)
+
+
+table(to_plot$status_relaxed, to_plot$type)
+
+```
+
+
+```{r}
+# joint_sig <- combined %>%
+#   filter(FDR_joint < 0.05)
+# 
+# 
+# ggplot(joint_sig, aes(x = log2fold_jointMUT, y = log2fold_MUT,
+#                       colour = FDR_MUT < 0.05)) +
+#   geom_point(alpha = 0.5) +
+#   geom_abline( slope = 1, intercept = 0, linetype = 3) +
+#   theme_bw() +
+#   xlim(-3,3) +
+#   ylim(-3,3) +
+#   labs(title = "MUT") +
+# ggplot(joint_sig, aes(x = log2fold_jointKO, y = log2fold_KO,
+#                       colour = FDR_KO < 0.05)) +
+#   geom_point(alpha = 0.5) +
+#   geom_abline( slope = 1, intercept = 0, linetype = 3) +
+#   theme_bw() +
+#   xlim(-3,3) +
+#   ylim(-3,3) +
+#   labs(title = "KO") +
+# plot_layout(ncol = 2) +
+# plot_annotation( title = "Joint analysis vs single analysis")
+
+#ggtern( data = combined, aes(x = -log10(P_joint), y = -log10(P_KO), z = -log0(P_MUT)) ) + geom_point()
+
+```
+
+As with gene expression there is a lot of shared signal between the two comparisons but the KO is always stronger than the mutants. So the 172 hits found in the mutant condition is probably an underestimation. I will therefore group the splicing hits from the joint analysis into 3 groups:
+
+* Significant in both = FDR_KO < 0.05 & P_MUT < 0.05 | FDR_MUT < 0.05 & P_KO < 0.05
+
+* Significant in KO only = FDR_KO < 0.05 & P_MUT > 0.05
+
+* Significant in MUT only = P_KO > 0.05 & FDR_MUT < 0.05
+
+
+
+So there are now lots of shared splicing variants and a large number of KO-specific events with no evidence of dyregulation in the FUS mutants (P_MUT > 0.05).
+Which types of splicing variants are shared or not shared?
+
+The proportions of splicing variants are similar between the KO specific and shared groups.
+
+Match in the groupings to res.clean
+
+```{r}
+
+```
+
+save res.clean as an Rdata file for future use
+
+```{r}
+```
+
+# plot the variant type distributions for each group
+
+```{r}
+res.clean <- ko.clean
+
+res.clean$status_strict <- combined$status_strict[ match(res.clean$featureID, combined$featureID)]
+res.clean$status_relaxed <- combined$status_relaxed[ match(res.clean$featureID, combined$featureID)]
+
+save(res.clean, file = "data/SGSeq/joint_analysis/novel_events/processed_all_joint.Rdata")
+# 
+# # play with type classification again
+# 
+# res.clean$type2 <- 
+#   map_chr( res.clean$variantType, ~{
+#     if( length(.x) == 1){ 
+#       .x
+#     }else{
+#       case_when(
+#         # test - how many complex variants are cassettes plus something or retained introns plus something?
+#         any(.x %in% c("SE:I")) &!any(.x %in% c("RI:R") ) ~ "SE+",
+#         any(.x %in% c("RI:R") & !any(.x %in% c("SE:I"))) ~ "RI+",
+#         all(.x %in% c("SE:I", "RI:R") ) ~ "WTF",
+#         TRUE ~ "unclassifiable"
+#       )
+#     }
+#   })
+
+# plot distribution of variant types in the 3 categories
+
+type_order <- 
+  res.clean %>%
+  filter( status_relaxed != "None" ) %>%
+  group_by(type) %>%
+  summarise( n = n() ) %>%
+  arrange((n) ) %>%
+  pull(type)
+
+# stupid hack - pad the upper range of the y axis so the numbers can be read
+
+type_counts <- 
+  res.clean %>%
+  filter(status_relaxed != "None") %>%
+  mutate(type = factor(type, levels = type_order)) %>%
+  mutate(status_relaxed = factor(status_relaxed, levels = c("Knockout specific", "Overlapping", "Mutation specific"))) %>%
+  group_by( status_relaxed, type) %>%
+    summarise( typecount = n() ) %>%
+  ungroup()
+
+padded <- 
+  type_counts %>%
+  split( .$status_relaxed) %>%
+  map_df( ~{
+    .x %>%
+    mutate( padding = typecount + 0.1 * max(typecount), paddier = typecount + 0.2 * max(typecount) )
+  } )
+
+
+type_translation = c(
+  "COMPLEX" = "complex",
+  "RI" = "retained intron",
+  "SE" = "cassette exon",
+  "A5SS" = "alternate 5\'",
+  "A3SS" = "alternate 3\'",
+  "AE" = "alternate end",
+  "AS" = "alternate start",
+  "MXE" = "mutually exclusive exons",
+  "AFE" = "alternate first exon",
+  "ALE" = "alternate last exon",
+  "S2E" = "multi-cassette"
+)
+
+plot_cols <- c("Overlapping" = "purple", 
+                    "Mutation specific" = "dodgerblue",
+                    "Knockout specific" = "firebrick2")
+
+type_count_plot <- 
+  ggplot(padded) +
+  scale_y_continuous(expand = c(0,0)) +
+  geom_col( aes( x = type, y = typecount, fill = status_relaxed )) +
+  geom_point( aes(x = type, y = paddier ), colour = NA ) +
+  geom_text( aes(x = type, y = padding, label = typecount ) ) +
+  facet_wrap(~ status_relaxed, scale = "free_x") +
+  scale_fill_manual(values = plot_cols) +
+  scale_x_discrete(labels = type_translation ) +
+  coord_flip() +
+  theme_classic() +
+  xlab("") +
+  ylab("") +
+  guides(fill = FALSE) +
+  #theme(axis.line.y.left = element_line() )
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.line.x=element_blank(),
+        strip.background = element_blank(),
+        strip.text = element_text(face="bold"),
+        axis.line.y.right = element_line(),
+        panel.spacing = unit(1, "lines") )
+
+type_count_plot
+
+ggsave(plot = type_count_plot,filename = "figures/splicing/SGSeq_variant_counts_relaxed.pdf", width = 6, height = 4)
+
+```
+
+Can I split the complex type up in into mostly intron retention or mostly cassette?
+
+```{r}
+
+
+splitComplexEvents <- function( featureIDs, bar_colour = "black"){
+# how many categories can be found?
+  complexes <- filter(res.clean, featureID %in% featureIDs)$variantType
+  
+  map_int(complexes, length) %>%
+    tibble( Categories = . ) %>%
+    group_by( Categories) %>%
+    summarise( n = n() ) %>%
+    knitr::kable()
+  
+  all_var_types <- unlist(complexes) %>% unique()
+  
+  # loop through each complex and record what events are there
+  co_oc <-
+    map( all_var_types,
+         ~{
+           category = .x
+           as.character(which(map_chr(complexes, ~{ category %in% .x}) == TRUE))
+         } )
+  
+  names(co_oc) <- all_var_types
+  
+  upset( data =  fromList(co_oc), nsets = length(co_oc), keep.order = TRUE, order.by = "freq", main.bar.color = bar_colour )
+  
+}
+
+overlapping_complexes <- filter(combined, status_relaxed == "Overlapping", type == "COMPLEX" )$featureID
+
+ko_complexes <- filter(combined, status_relaxed == "Knockout specific", type == "COMPLEX" )$featureID
+
+# run this in the console to save plots - doesn't work with Rmarkdown
+# 
+# pdf("figures/splicing/complex_variants_overlapping.pdf", onefile = FALSE)
+# splitComplexEvents(overlapping_complexes, bar_colour = "purple")
+# dev.off()
+# 
+# pdf("figures/splicing/complex_variants_knockout.pdf", onefile = FALSE)
+# splitComplexEvents(ko_complexes, bar_colour = "firebrick3") 
+# dev.off()
+# 
+
+```
+
+
+
+Compare the joint analyses to the individual analyses
+
+```{r}
+individual_analyses <- list.files(path = "data/SGSeq/novel_events/", pattern = "dexseq_novel.RData",full.names = TRUE )
+
+indiv <- map( individual_analyses, cleanResults)
+
+names(indiv) <- 
+  c("Bozzoni_KO","Bozzoni_MUT","Dupuis_KO","Dupuis_MUT","Fratta_MUT_HET","Fratta_MUT", "Fratta_KO_HET", "Fratta_KO")
+
+totals <- map(indiv, filter, padj < 0.05) %>% map(nrow)
+
+# match variants by coordinates
+separate_coords <- map(indiv, filter, padj < 0.05) %>% map("coords")
+
+# count up splicing event types
+all_types <- unique(indiv$Fratta_MUT$type)
+
+map(indiv, filter, padj < 0.05) %>% map("type") %>% map( ~{table(.x)})
+
+
+joint_ko_coords <- ko.clean %>% filter(padj < 0.05) %>% pull("coords")
+joint_mut_coords <- mut.clean  %>% filter(padj < 0.05) %>% pull("coords")
+
+# which of the individual analysis events are found in the joint models?
+indiv$Bozzoni_KO$joint <- indiv$Bozzoni_KO$coords %in% joint_ko_coords
+df <- indiv$Bozzoni_KO
+# are higher expressed genes more likely to replicate?
+df_status <- 
+  df %>%
+  mutate(status = case_when(
+    padj < 0.05 & joint == TRUE ~ "sig.joint",
+    padj < 0.05 & joint == FALSE ~ "sig.indiv",
+    padj > 0.05 & joint == TRUE ~ "null.joint",
+    TRUE ~ "remove"
+  )) %>%
+  filter( status != "remove")
+
+
+ggplot(df_status, aes(x = status, y = -log10(pvalue) )) +
+  geom_boxplot(notch=TRUE) +
+ggplot(df_status, aes(x = status, y = log10(baseMean))) +
+  geom_boxplot(notch=TRUE) +
+  plot_layout(nrow = 1) +
+ggplot(df_status, aes(x = log2FoldChange, y = -log10(pvalue))) +
+  geom_point(aes(colour = status))
+
+
+pairwise.wilcox.test(df_status$pvalue, g = df_status$status)
+
+
+df <- arrange(df, padj) %>% head(1500)
+df$bin <- ntile(x = df$padj, n = 30)
+group_by(df,bin) %>%
+  summarise( prop_joint = sum(joint))
+
+joint_all_coords <- unique(c(joint_ko_coords, joint_mut_coords))
+
+ko_overlap_coords <- map(separate_coords, intersect, y = joint_ko_coords) %>% map(length)
+mut_overlap_coords <- map(separate_coords, intersect, y = joint_mut_coords) %>% map(length)
+non_overlap_coords <- map(separate_coords, setdiff, y = joint_all_coords) %>% map(length)
+
+single_vs_joint_coords <- 
+  bind_rows( totals, ko_overlap_coords, mut_overlap_coords, non_overlap_coords) %>%
+  mutate(n = c("total", "KO overlap", "MUT overlap", "remaining")) %>%
+  dplyr::select( n, ends_with("MUT"), ends_with("KO") )
+
+
+write.csv(single_vs_joint_coords, file = "results/03_SGSeq/single_vs_joint_numbers_per_splicing_event.csv")
+
+#------------------------------------------
+# count by gene instead of splicing variant
+
+# # or by gene? removes coordinate mismatching headaches
+# use geneName rather than gene due to gene having NA values
+separate_genes <- map(indiv, filter, padj < 0.05) %>% map("geneName")
+
+joint_ko_genes <- ko.clean %>% filter(padj < 0.05) %>% pull("geneName")
+joint_mut_genes <- mut.clean  %>% filter(padj < 0.05) %>% pull("geneName")
+
+total_genes <- map(indiv, ~{
+  filter(.x, padj < 0.05) %>%
+  pull("geneName") %>%
+  unique() %>%
+  length()
+})
+
+joint_all_genes <- unique(c(joint_ko_genes, joint_mut_genes))
+
+ko_overlap <- map(separate_genes, intersect, y = joint_ko_genes) %>% map(length)
+mut_overlap <- map(separate_genes, intersect, y = joint_mut_genes) %>% map(length)
+non_overlap <- map(separate_genes, setdiff, y = joint_all_genes) %>% map(length)
+
+indiv_matched <- indiv %>% map( ~{
+  .x <- filter(.x, padj < 0.05)
+  .x$joint_ko <- match(.x$geneName, joint_ko_genes)
+  .x$joint_mut <- match(.x$geneName, joint_mut_genes)
+  .x
+})
+
+single_vs_joint <- 
+  bind_rows( total_genes, ko_overlap, mut_overlap, non_overlap) %>%
+  mutate(n = c("total", "KO overlap", "MUT overlap", "remaining")) %>%
+  dplyr::select( n, ends_with("MUT"), ends_with("KO") )
+
+single_vs_joint
+  
+write.csv(single_vs_joint, file = "results/03_SGSeq/single_vs_joint_numbers_per_gene.csv")
+
+ko.clean %>% filter(padj < 0.05 ) %>% nrow()
+mut.clean %>% filter(padj < 0.05 ) %>% nrow()
+
+# what are these genes that are unique to each dataset?
+unique_genes <- map( indiv_matched, ~{
+  filter(.x,is.na(joint_ko)) %>%
+  pull("gene") %>%
+  unique()
+})
+
+unique_profiles <-
+  unique_genes %>%
+  map( makeGProfile)
+
+# Bozzoni KO and Fratta KO unique genes are mildly enriched in protein binding. Meh
+
+
+# get out FUS intron p values
+i6 <- "chr7:127972770-127974400"
+i7 <- "chr7:127974434-127975888"
+
+map_df(indiv, ~{
+  i6 <- filter(.x , coords == i6)
+}, .id = "ID")
+
+map_df(indiv, ~{
+  i7 <- filter(.x , coords == i7)
+}, .id = "ID")
+
+```
+
+# Following from that - compare HET and HOM
+
+Make volcano plot of Fratta D14 HOM splicing
+
+```{r}
+
+fratta_mut_splicing <- indiv$Fratta_MUT
+ 
+fratta_mut_splicing %>%
+  ggplot(
+    aes(x = log2FoldChange, y = -log10(pvalue))) +
+  geom_point(aes(colour = padj < 0.05 & !is.na(padj) ) ) +
+  scale_colour_manual( values = c("gray", "red") ) +
+  theme_classic() +
+  xlab( expression( log[2]~fold~change)  ) +
+  ylab( expression( -log[10]~P )) +
+  guides(colour = FALSE) +
+  geom_text(data = filter(fratta_mut_splicing, gene %in% c("Fus"), padj < 0.05 ),
+                  aes(label = gene),nudge_x = 0.2) +
+  #xlim(-2,2) +
+  labs(title = "Differential splicing", subtitle = "79 splicing events significant at q < 0.05")
+
+ggsave(filename = "scripts/Misc/splicing_volcano.pdf", width = 5, height = 5)
+
+
+
+
+```
+
+
+
+FUS is known to interact with the U1 snRNP.
+In all 3 sets there are more novel 5' splice events than novel 3', suggesting that U1 is impaired more so than U2.
+I also predict that loss of U1 should lead to exon skipping through impairment of exon recognition.
+Can I see this in the data?
+
+```{r}
+
+
+
+to_test <-
+  combined %>%
+  filter( status_relaxed %in% c("Knockout specific", "Overlapping") ) %>% 
+  filter(type %in% c("SE","RI", "COMPLEX","A5SS", "A3SS")) 
+  
+to_test %>%
+  ggplot( aes( x = type, y = lfc_ko)) + 
+  facet_wrap(~status_relaxed) +
+  geom_violin() +
+  geom_boxplot(width = 0.1) +
+  coord_flip() +
+  geom_hline(yintercept =0) +
+  theme_classic()
+
+# test each set of variants in each set of genes
+# one sample wilcoxon
+direction_binom <-
+  to_test %>%
+  split( .$status_relaxed) %>%
+  map_df( ~{
+    events <- split(.x, .x$type)
+    map_df( events, ~{
+      directions <- .x$lfc_ko
+      n = length(directions)
+      x = sum(directions > 0)
+      res <- binom.test(x,n)
+      broom::tidy(res)
+    }, .id = "type")
+  }, .id = "set")
+
+direction_binom %>%
+  ggplot( aes( x = type, y = estimate )) +
+  geom_point() +
+  ylim(0,1) +
+  facet_wrap(~set) +
+  geom_errorbar( aes(x = type,  ymin = conf.low, ymax = conf.high), width = 0.1) +
+  geom_hline( yintercept = 0.5, linetype = 3) +
+  coord_flip() +
+  xlab("") +
+  ylab("Proportion of events with increased inclusion")
+
+direction_binom$padj <- p.adjust(direction_binom$p.value, method = "bonferroni")
+
+```
+

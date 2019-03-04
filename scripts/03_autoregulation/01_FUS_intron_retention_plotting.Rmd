@@ -1,0 +1,363 @@
+---
+title: "Autoregulation"
+author: "Jack Humphrey"
+date: "25 May 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "~/google_drive/Work/PhD_Year_4/FUS_meta-analysis/")
+library(SGSeq)
+library(DEXSeq)
+library(purrr)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(stringr)
+library(readr)
+library(patchwork)
+```
+
+```{r}
+# load res.clean
+load("data/SGSeq/joint_analysis/novel_events/processed_all_joint_functionality.Rdata")
+
+# load support
+support <- read_tsv("data/SGSeq/novel_events/joint_SGSeq_novel_support.tab")
+
+# load biomart mouse
+biomart <- read_tsv("misc/biomart_annotations_mouse.txt")
+
+
+# FUNCTIONS
+
+# PSI creation
+loadSGVC <- function(RData){
+  load(RData)
+  return(sgvc)
+}
+
+createPSI <- function(sgvc, res.sig, support){
+  
+  all_counts <- as.data.frame(counts(sgvc))
+  all_counts$vid <- mcols(sgvc)$variantID
+  all_counts$eid <- mcols(sgvc)$eventID
+  
+  hitcounts <- filter(all_counts, eid %in% res.sig$groupID)
+  # for each event ID,
+  # split by effect ID (shared) and divide each column by the column sum to get PSI
+  psi <- 
+    split(hitcounts, hitcounts$eid) %>%
+    map_df( ~{
+      vid <- .x$vid
+      eid <- .x$eid
+      sums <- colSums(.x)
+      # if colSum is 1 or 0 - special cases - set to NA
+      sums[ sums == 1 | sums == 0] <- NA
+      df <- sweep( .x, MARGIN = 2, STATS = sums, FUN = "/")
+      # now set any wacky values to 0
+      is.na(df) <- sapply(df, is.infinite)
+      df[ is.na(df) ] <- 0
+      df$vid <- vid
+      df$eid <- eid
+      return(df)
+    })
+  
+  res.sig$featureID <- as.numeric(sig$featureID)
+  res.sig$groupID <- as.numeric(sig$groupID)
+  
+  # add back the variant and effect IDs
+  psi_df <-
+    psi %>%
+    dplyr::rename( featureID = vid, groupID = eid ) %>%
+    dplyr::select(featureID, groupID, everything() ) %>%
+    tidyr::gather( "sample_name", "PSI", -featureID, -groupID ) %>%
+    left_join(x = ., y = support, by = "sample_name") %>%
+    left_join(x = ., y = res.sig, by = c("featureID", "groupID") )
+  
+  return(psi_df)
+}
+
+```
+
+
+
+
+```{r}
+psiPlot <- function(id, PSI_df = psi_df, dataset.filter=NA, return=FALSE, group = "both", no_het = TRUE){
+  dataset_order <- c("Bozzoni\nMUT", "Dupuis\nMUT","Fratta\nMUT", "Bozzoni\nKO", "Dupuis\nKO", "Fratta\nKO")
+  if( !is.na(dataset.filter) ){
+    PSI_df <- filter(PSI_df, dataset == dataset.filter)
+  }
+  
+  if(no_het == TRUE){
+    PSI_df <- filter(PSI_df, !grepl("HET", sample_name))
+  }
+  
+  df <- filter(PSI_df, featureID == as.character(id) ) %>%
+    mutate(condition = gsub("FUS_", "", condition)) %>%
+    mutate(condition = gsub("_", "\n", condition)) %>%
+    mutate(dataset = gsub("Nicol", "Fratta", dataset)) %>%
+    mutate(condition = factor(x = condition, levels = c("CTL","MUT","MUT\nHET","MUT\nHOM","KO","KO\nHET","KO\nHOM"))) %>%
+    dplyr::select(sample = sample_name, PSI, dataset, condition, gene, type) %>%
+    mutate(dataset_separate = str_split(sample,pattern = "-", n = 2, simplify = TRUE )[,1] ) %>%
+    mutate(dataset_separate = case_when( 
+      dataset_separate == "Dupuis_KO" ~ "Dupuis\nKO",
+      dataset_separate == "Dupuis_NLS" ~ "Dupuis\nMUT",
+      dataset_separate == "Bozzoni" ~ "Bozzoni",
+      dataset_separate == "Nicol_d14" ~ "Fratta\nMUT",
+      dataset_separate == "Nicol_KO" ~ "Fratta\nKO") ) 
+  df <- df[ complete.cases(df),]
+  
+   psi_table_split <- split(df, df$dataset_separate)
+  
+  # split Bozzoni into KO and MUT and double up controls
+  psi_table_split$Bozzoni_KO <- 
+    psi_table_split$Bozzoni %>%
+    filter(condition != "MUT") %>%
+    mutate(dataset_separate = "Bozzoni\nKO")
+  
+  psi_table_split$Bozzoni_MUT <- 
+    psi_table_split$Bozzoni %>%
+    filter(condition != "KO") %>%
+    mutate(dataset_separate = "Bozzoni\nMUT")
+  
+  psi_table_split$Bozzoni <- NULL
+  # put back together
+  psi_table <- 
+    map_df( psi_table_split, ~{.x})
+  
+  
+  
+  if(return==TRUE){
+    return(psi_table)
+  }
+  
+  psi_table <-
+    mutate( psi_table,
+            dataset_separate = factor( 
+              dataset_separate,
+              levels = dataset_order))
+  
+  # calculate means per condition and dataset
+  means <-
+    psi_table %>%
+     group_by(dataset_separate, condition) %>%
+    summarise( condition_mean = mean(PSI))
+  
+  # normalise by mean in control for that dataset
+  # control_means <- 
+  #   filter(means, condition == "CTL") %>%
+  #   select( dataset_separate, control_mean = condition_mean)
+  # 
+  # 
+  psi_table <-
+    psi_table %>%
+    #left_join( control_means, by = "dataset_separate") %>%
+    #mutate( normalised = counts / control_mean) %>%
+     left_join( means, by = c("dataset_separate", "condition"))
+  # 
+    
+  cols <- c("CTL" = "darkgray", 
+            "MUT" = "dodgerblue3", "MUT\nHET" = "dodgerblue", "MUT\nHOM" = "dodgerblue3", 
+            "KO" = "firebrick2", "KO\nHET" = "firebrick1", "KO\nHOM" = "firebrick2" )
+  
+  if( group != "both"){
+    if(group == "KO"){
+      psi_table <- filter(psi_table, grepl("KO", dataset_separate))
+    }
+    if(group == "MUT"){
+      psi_table <- filter(psi_table, grepl("MUT", dataset_separate))
+    }
+  }
+  
+  p <- 
+    psi_table %>%
+    ggplot( aes( y = PSI, label = sample, x = condition, colour = condition) ) +
+    #ggplot( aes( x = condition, y = PSI, colour = condition )) +
+    geom_beeswarm(cex = 7) +
+    #geom_jitter(width = 0.2, height = 0) +
+    geom_errorbar( aes(x = condition, ymin = condition_mean, ymax = condition_mean ), width = 0.5, colour = "black" ) +
+    facet_grid(. ~dataset_separate, scale = "free_x", space = "free_x" ) +
+    #geom_errorbar(data = means, aes(x = condition, ymin = PSI, ymax = PSI), width = 0.5, colour = "black") +
+    #geom_point() +
+    theme_bw() +
+    theme(panel.grid = element_blank(),
+          axis.title.y=element_blank(),
+          panel.spacing.x = unit(0, "lines"),
+          panel.border = element_rect(colour = "darkgrey"),
+          #axis.line = element_line(colour = "black"),
+          #axis.text.y=element_blank(),
+          #axis.ticks.y=element_blank(),
+          plot.title = element_text(face = "italic",hjust = 0.5),
+          plot.subtitle = element_text(hjust = 0.5),
+          strip.background = element_blank()
+    ) +
+    scale_colour_manual(values = cols) +
+    labs(title = paste(id, df$gene, df$type) ) +
+    guides(colour = FALSE) +
+    xlab("") +
+    ylab("Percentage spliced in")
+  return(p)
+}
+
+#psiPlot("133472", group = "MUT")
+
+```
+
+
+
+```{r}
+results_all <- "data/SGSeq/joint_analysis/novel_events/all_samples_joint_SGSeq_analysis_novel.Rdata"
+
+#res.clean <- cleanResults(results_all)
+
+sgvc <- loadSGVC(results_all)
+
+sig <- 
+  dplyr::filter(res.clean, padj  < 0.05) %>%
+  dplyr::select( gene,coords, type, everything() ) %>%
+  dplyr::arrange(padj)
+
+
+psi_df <- createPSI( sgvc, res.sig =  sig, support )
+
+
+```
+
+
+```{r}
+# get all Fus splice variants
+fus_variants <- filter(sig, gene == "Fus")
+
+plots <- map( fus_variants$featureID, psiPlot)
+
+# two introns in FUS 
+
+#pdf("Figures/Autoregulation/FUS_intron_PSIs.pdf", width = 12, height = 5)
+# p <- 
+#   psiPlot(133472) +
+#   psiPlot(133474) +
+#   plot_layout(ncol=2)
+
+
+
+# p <-
+#   psiPlot(133472, dataset.filter = "Bozzoni") + 
+#   psiPlot(133472, dataset.filter = "Dupuis") + 
+#   psiPlot(133472, dataset.filter = "Nicol") + 
+#   psiPlot(133474, dataset.filter = "Bozzoni") + 
+#   psiPlot(133474, dataset.filter = "Dupuis") + 
+#   psiPlot(133474, dataset.filter = "Nicol") +
+#   plot_layout(nrow = 2)
+
+
+# run in console
+# pdf("Figures/Autoregulation/FUS_intron_PSIs.pdf", width = 15, height = 8)
+# print(p)
+# dev.off()
+
+# all 3 datasets for supplementary
+
+p1 <- psiPlot(133472, group = "MUT", no_het = FALSE) + labs(title = "Intron 6 inclusion") + ylim(0,1)
+p2 <- psiPlot(133474, group = "MUT", no_het = FALSE) + labs(title = "Intron 7 inclusion") + ylim(0,1)
+p3 <- psiPlot(133471, group = "MUT", no_het = FALSE) + ylim(0,1) + labs(title = "Exon 7 inclusion")
+
+multipanel <- p1 + p2 + p3 + plot_layout(nrow =3)
+
+#multipanel
+# pdf("Figures/Autoregulation/FUS_intron_PSIs.pdf", width = 12, height = 3)
+# print(multipanel)
+# dev.off()
+
+ggsave(filename = "Figures/Autoregulation/all_datasets_FUS_intron_PSIs.pdf", plot = multipanel, width = 4, height = 7)
+
+
+# plot just Nicol for main figure
+p1 <- 
+  psiPlot(133472, dataset.filter = "Nicol") + 
+  labs(title = "Intron 6 inclusion") + ylim(0,1) + 
+  theme(strip.text = element_blank(), title = element_text(size = 8) )
+p2 <- 
+  psiPlot(133471, dataset.filter = "Nicol") + ylim(0,1) + 
+  labs(title = "Exon 7 inclusion") + 
+  theme(strip.text = element_blank(), title = element_text(size = 8), axis.title.y = element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank())
+p3 <- 
+  psiPlot(133474, dataset.filter = "Nicol") + 
+  labs(title = "Intron 7 inclusion") + ylim(0,1) + 
+  theme(strip.text = element_blank(), title = element_text(size = 8), axis.title.y = element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+multipanel <- p1 + p2 + p3 + plot_layout(ncol=3)
+
+ggsave(filename = "Figures/Autoregulation/Fratta_FUS_intron_PSIs.pdf", plot = multipanel, width = 7, height = 3.5)
+
+# do stats on fratta PSI
+
+sink(file = "figures/Autoregulation/autoregulation_stats.txt")
+
+intron6 <- psiPlot(133472, dataset.filter = "Nicol", return = TRUE) 
+intron6 <- filter(intron6, condition != "KO\nHOM")
+anova_intron_6 <- aov(intron6, formula = PSI ~ condition)
+
+print("Intron 6")
+summary(anova_intron_6)
+TukeyHSD(x = anova_intron_6 )
+
+print("Intron 7")
+intron7 <- psiPlot(133474, dataset.filter = "Nicol", return = TRUE) 
+intron7 <- filter(intron7, condition != "KO\nHOM")
+anova_intron_7 <- aov(intron7, formula = PSI ~ condition)
+summary(anova_intron_7)
+TukeyHSD(x = anova_intron_7 )
+
+sink()
+
+
+#psiPlot(133472, dataset.filter = "Bozzoni")
+
+# filter( psi_df, featureID == "133472" ) %>%
+#   group_by(condition) %>%
+#   summarise( PSI = mean(PSI)) %>%
+#   ggplot( aes(x = condition, y = PSI)) + geom_point(shape = 21, size = 20)
+
+```
+
+
+```{r}
+load( "data/SGSeq/joint_analysis/novel_events/processed_all_joint.Rdata")
+# PSI plots for the splicing multipanel figure
+
+# Nrxn3 Cassette exon
+nrxn3 <- filter(res.clean, status_relaxed == "Overlapping", gene == "Nrxn3")$featureID
+# Hnrnpa1 - complex event
+hnrnpa1 <- filter(res.clean, status_relaxed == "Overlapping", gene == "Hnrnpa1")$featureID[2]
+
+# Ybx1 - complex event
+ybx1 <- filter(res.clean, status_relaxed == "Overlapping", type == "COMPLEX", gene == "Ybx1")$featureID
+
+ewsr1 <- filter(res.clean, status_relaxed == "Overlapping", gene == "Ewsr1")$featureID[1]
+
+mapt <- filter(res.clean, status_relaxed == "Overlapping", gene == "Mapt")$featureID[3]
+
+
+splicing_multiplot <-
+  psiPlot(nrxn3) +
+  psiPlot(ybx1) +
+  psiPlot(ewsr1) +
+  plot_layout(nrow=3)
+
+#multiplot
+
+ggsave(filename = "Figures/splicing/example_psi_plots.pdf", plot = splicing_multiplot, width = 6, height = 7)
+
+#psiPlot(hnrnpa1)
+
+
+
+#psiPlot(mapt)
+
+
+
+```
+

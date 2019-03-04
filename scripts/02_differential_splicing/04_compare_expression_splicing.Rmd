@@ -1,0 +1,89 @@
+# comparing expression and splicing changes
+library(tidyverse)
+library(gProfileR)
+# differentially expressed genes
+load("results/02_DESeq/combined_wald_DESeq_data.Rdata")
+
+# splicing
+#load("data/SGSeq/joint_analysis/novel_events/processed_all_joint_functionality.Rdata")
+load("data/SGSeq/joint_analysis/novel_events/processed_all_joint.Rdata")
+deg_sig <- filter(combined, status_relaxed != "None", !is.na(gene_name))
+
+ds_sig <- filter(res.clean, status_relaxed != "None", !is.na(gene))
+
+#intersect(deg_sig$gene_name, ds_sig$gene)
+
+ds_sig_split <- split(ds_sig, ds_sig$status_relaxed)
+deg_sig_split <- split(deg_sig, deg_sig$status_relaxed)
+
+# how many differentially expressed genes also have splicing events?
+ko_specific <- intersect(ds_sig_split$`Knockout specific`$gene, deg_sig_split$`Knockout specific`$gene_name)
+overlapping <- intersect(ds_sig_split$`Overlapping`$gene, deg_sig_split$`Overlapping`$gene_name)
+#intersect(ds_sig_split$`Mutation specific`$gene, deg_sig_split$`Mutation specific`$gene_name)
+# none in mutant specific
+
+ko_specific_splicing <- filter(ds_sig, gene %in% ko_specific)
+overlapping_splicing <- filter(ds_sig, gene %in% overlapping)
+
+ko_specific_deg <- filter(combined, gene_name %in% ko_specific)
+overlapping_deg <- filter(combined, gene_name %in% overlapping)
+
+all_splicing <- rbind(ko_specific_splicing, overlapping_splicing)
+all_expression <- rbind(ko_specific_deg, overlapping_deg)
+all_splicing$gene_expression_ko <- all_expression$lfc_ko[ match(all_splicing$gene, all_expression$gene_name)]
+
+table(all_splicing$type, upregulated = all_splicing$gene_expression_ko > 0)
+
+gprofiler(unique(all_splicing$gene), organism = "mmusculus")
+
+# iclip binding?
+iclip <- "data/iCLIP/peaks_id72803_rnd100_flank15_fdr0.1_group_3094_FUS-E18-all_sum_G_mm10--ensembl59_from_2320-3089-3090_bedGraph-cDNA-hits-in-genome.bed.gz_lowFDR_clusters_stranded_sorted.bed"
+
+iclip <- rtracklayer::import.bed(iclip)
+score(iclip) <- as.numeric(mcols(iclip)$name)
+
+# filter by number of reads
+iclip <- iclip[ abs(iclip$score) >= 2 ]
+
+res.grange <- 
+  all_splicing %>%
+  separate(coords, into = c("v.chr", "v.start", "v.end"), sep = ":|-") %>%
+  dplyr::select( v.chr, v.start, v.end, strand, gene, pvalue, padj, log2foldchange = log2fold_FUS_KO_CTL, featureID, type) 
+
+res.grange <- GenomicRanges::GRanges(seqnames = res.grange$v.chr,
+                                     ranges = IRanges(start = as.numeric(res.grange$v.start),
+                                                      end =  as.numeric(res.grange$v.end)
+                                     ),
+                                     strand = res.grange$strand,
+                                     gene = res.grange$gene,
+                                     pvalue = res.grange$pvalue,
+                                     padj = res.grange$padj,
+                                     log2foldchange = res.grange$log2foldchange,
+                                     featureID = res.grange$featureID,
+                                     type = res.grange$type
+                                     
+)
+
+nearest_iclip <- iclip[
+  GenomicRanges::nearest(
+    x = res.grange,
+    subject = iclip)
+  ]
+
+all_splicing$iclip.distance <- GenomicRanges::distance(x = res.grange, y = nearest_iclip)
+
+
+by_gene <- all_splicing %>%
+  group_by(gene) %>%
+  summarise( iclip.distance =  min(iclip.distance))
+
+nrow(by_gene)
+
+
+table(by_gene$iclip.distance == 0)
+
+filter(by_gene, iclip.distance == 0)
+
+filter(all_splicing, iclip.distance == 0) %>%
+  group_by(gene) %>%
+  summarise( lfc = first(gene_expression_ko))

@@ -1,0 +1,1238 @@
+---
+title: "3'UTR binding"
+author: "Jack Humphrey"
+date: "8 June 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "~/google_drive/Work/PhD_Year_4/FUS_meta-analysis/")
+library(readr)
+library(tidyr)
+library(furrr)
+library(purrr)
+plan(multiprocess)
+library(dplyr)
+library(plotly)
+library(patchwork)
+library(pheatmap)
+library(DESeq2)
+library(gProfileR)
+```
+
+FUS is known to bind 3'UTRs. How many of the differentially expressed or differentially spliced genes show evidence of FUS binding to their 3'UTR?
+
+```{r}
+# downloaded from UCSC table browser
+utr_data <- "misc/gencode_mouse_3UTR_exons.bed"
+
+
+gencode <- "misc/gencode.vM17.annotation.gtf.gz"
+
+
+gtf <- rtracklayer::import.gff(con = gencode, format = "gtf")
+
+polyA_features <- "misc/gencode.vM18.polyAs.gtf.gz"
+
+polyA_gtf <- rtracklayer::import.gff(con = polyA_features, format = "gtf")
+score(polyA_gtf) <- 1
+#export.bed(polyA_gtf, con = "misc/gencode.vM18.polyAs.bed")
+
+
+# prepare iCLIP
+
+# FUS
+iclip_fus_path <- "data/iCLIP/peaks_id72803_rnd100_flank15_fdr0.1_group_3094_FUS-E18-all_sum_G_mm10--ensembl59_from_2320-3089-3090_bedGraph-cDNA-hits-in-genome.bed.gz_lowFDR_clusters_stranded_sorted.bed"
+
+iclip_fus <- rtracklayer::import.bed(iclip_fus_path)
+score(iclip_fus) <- as.numeric(mcols(iclip_fus)$name)
+iclip_fus <- iclip_fus[ abs(iclip_fus$score) >= 2 ]
+
+
+# U2AF65 - positive control
+iclip_u2af_path <- "data/iCLIP/peaks_id72809_rnd100_flank15_fdr0.1_group_2408_Mouse-brain-U2AF65_sum_G_mm10--ensembl59_from_1240-1241_bedGraph-cDNA-hits-in-genome.bed.gz_lowFDR_clusters_stranded.bed.gz"
+ 
+iclip_u2af <- rtracklayer::import.bed(iclip_u2af_path)
+score(iclip_u2af) <- as.numeric(mcols(iclip_u2af)$name)
+iclip_u2af <- iclip_u2af[ abs(iclip_u2af$score) >= 2 ]
+
+
+
+# filter by number of reads
+#iclip_pos <- iclip[score(iclip) > 0]
+#iclip_neg <- iclip[score(iclip) < 0]
+
+
+# UTR exons
+#utr <- rtracklayer::import.bed(utr_data)
+# flank utr exons by 100bp upstream and 5kb downstream
+#utr_resized <- resize(utr, width =  width(utr) + 5000L, fix = "start")
+#utr_resized <- resize(utr_resized, width =  width(utr_resized) + 100L, fix = "end")
+
+# overlap the UTR exons to iCLIP peaks
+#findOverlaps( utr, iclip)
+#iclip_utr_overlaps <- findOverlaps( utr_resized, iclip)
+
+# match these overlapping UTRs to genes
+biomart <- read_tsv("misc/biomart_annotations_mouse.txt")
+
+biomart_gr <- GRanges(seqnames = biomart$chr, 
+                      ranges = IRanges(start = biomart$start, end = biomart$end),
+                      strand = biomart$strand,
+                      gene = biomart$gene_name,
+                      EnsemblID = biomart$EnsemblID)
+
+#fus_utrs <- utr_resized[ queryHits(iclip_utr_overlaps)]
+
+#biomart_utr_overlap <- findOverlaps(biomart_gr, fus_utrs  )
+
+#overlap_genes <- queryHits( biomart_utr_overlap )
+
+#fus_utr_genes <- biomart_gr[unique(overlap_genes)]
+
+# now have a list of ~2000 genes with some evidence of FUS binding their 3'UTRs
+# filtering on score >= 3 goes down to 1600
+
+```
+
+
+Differentially expressed genes 
+
+```{r}
+load("results/02_DESeq/combined_wald_DESeq_data.Rdata")
+
+# compare iCLIP enrichment in each genomic feature - 5'UTR, exons, introns and 3'UTRs 
+# between upregulated and downregulated genes
+
+# get raw expression values for normalisation
+load("data/DESeq2/joint/fixed_covariate/joint_DESEq_condition_all_deseq.Rdata")
+
+frattaWildtypeCount <- function(genes, counts = counts.loc){
+  counts <- as.data.frame(counts)
+  
+  counts <- counts[genes,]
+  wildtypes <- dplyr::select(
+    counts, matches("Nicol.*WT") 
+    )
+  
+  # normalise counts by sizeFactors
+  sizeFactors <- DESeq2::estimateSizeFactorsForMatrix(counts = wildtypes)
+  
+  wildtypes_norm <- sweep(wildtypes, MARGIN = 2, STATS = sizeFactors, FUN = "*")
+  
+  # get mean count
+  event_mean_norm <- rowMeans(wildtypes_norm)
+  
+  return(event_mean_norm)
+  # eid %in% res$groupID
+}
+
+# add on gene length and wildtype expression
+
+combined$frattaBaseMean <- frattaWildtypeCount(combined$EnsemblID, counts = counts.loc)
+
+combined$gene_length <- combined$end - combined$start
+
+combined$direction <- ifelse(combined$lfc_ko > 0, "UP", "DOWN")
+
+# prove that significant genes are both longer and more highly expressed
+plot_colours <- c(
+    "Overlapping" = "purple",
+    "None" = "grey",
+    "Mutation specific" = "dodgerblue",
+    "Knockout specific" = "firebrick2"
+  )
+  
+length_plot <- 
+  combined %>%
+  filter(!is.na(direction)) %>%
+  mutate( mygroup = factor(
+    x = paste(status_relaxed, direction),
+    levels = c("None UP", "None DOWN", 
+               "Overlapping UP", "Overlapping DOWN",
+               "Mutation specific UP", "Mutation specific DOWN",
+               "Knockout specific UP", "Knockout specific DOWN")
+    )) %>%
+  ggplot(aes(x = mygroup, y = log10(gene_length), group = mygroup )) +
+  #geom_violin() + 
+  xlab("") +
+  geom_boxplot(notch = TRUE, aes(fill = status_relaxed, alpha = direction, group = mygroup)) +
+  theme_classic() +
+  scale_alpha_manual(values = c(0.5,1)) +
+  scale_fill_manual(values = plot_colours) +
+  guides(fill = FALSE, alpha = FALSE) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1) ) +
+  labs(title="A") +
+  theme(plot.title = element_text(face = "bold", vjust = 1))
+
+expression_plot <- 
+  combined %>%
+  filter( !is.na(frattaBaseMean)) %>%
+  filter( !is.na(direction)) %>%
+  mutate( mygroup = factor(
+    x = paste(status_relaxed, direction),
+    levels = c("None UP", "None DOWN", 
+               "Overlapping UP", "Overlapping DOWN",
+               "Mutation specific UP", "Mutation specific DOWN",
+               "Knockout specific UP", "Knockout specific DOWN")
+    )) %>%
+  ggplot(aes(x = mygroup, y = log10(frattaBaseMean), group = mygroup )) +
+  #geom_violin() + 
+  xlab("") +
+  geom_boxplot(notch = TRUE, aes(fill = status_relaxed, alpha = direction, group = mygroup)) +
+  theme_classic() +
+  scale_alpha_manual(values = c(0.5,1)) +
+  scale_fill_manual(values = plot_colours) +
+  guides(fill = FALSE, alpha = FALSE) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1) ) +
+  labs(title = "B") +
+  theme(plot.title = element_text(face = "bold", vjust = 1))
+  #labs(title="Wildtype expression per class of gene split by direction")
+
+multiplot <- 
+  length_plot +
+  expression_plot +
+  plot_layout(nrow= 2)
+
+ggsave(plot = multiplot, filename = "figures/Gene_Expression/expression_length_comparisons.pdf", width = 6, height = 6)
+
+```
+
+
+Create regularised nulls
+
+```{r}
+
+
+# filter out None genes
+sig <- filter(combined,status_relaxed != "None")
+
+# split by status and direction
+
+sig$status_relaxed_direction <- paste0(sig$status_relaxed,"_", sig$direction)
+
+gene_sets <- split(sig, sig$status_relaxed_direction)
+
+
+# for each gene set create a custom null set for comparisons
+# the null should be a set of genes that:
+# * are not differentially expressed
+# * have the same distribution of gene lengths
+# * have the same distribution of baseMeans
+
+regulariseNull <- function(gene_direction = "UP", gene_status = "Overlapping"){
+  sig <- filter(combined, direction == gene_direction, status_relaxed == gene_status)
+  null <- filter(combined, direction == gene_direction, status_relaxed == "None")
+
+  sig_depth <- log10(sig$frattaBaseMean) 
+
+  sig_depth_quartile1 <- summary(sig_depth)[2]
+  sig_depth_quartile3 <- summary(sig_depth)[5]
+
+  null <- filter(null,
+                 frattaBaseMean >= 10^sig_depth_quartile1 &
+                   frattaBaseMean <= 10^sig_depth_quartile3
+  )
+  
+  sig_length <- log10(sig$gene_length) 
+
+  sig_length_quartile1 <- summary(sig_length)[2]
+  sig_length_quartile3 <- summary(sig_length)[5]
+
+  null <- filter(null,
+                 gene_length >= 10^sig_length_quartile1 &
+                 gene_length <= 10^sig_length_quartile3
+  )
+  
+  return(null)
+}
+
+names(gene_sets)
+
+null_sets <- 
+  map2(.x = rep( c("DOWN","UP"), 3 ),
+     .y =  c("Knockout specific", "Knockout specific", 
+            "Mutation specific", "Mutation specific",
+            "Overlapping", "Overlapping"),
+     regulariseNull
+)
+
+names(null_sets) <- names(gene_sets)
+```
+
+# What about minor genes? While I have the null and sig sets, look for enrichment of minor intron genes.
+
+```{r}
+u12_data <- read_tsv("data/U12DB/u12_mouse.txt")
+u12_gff <- (rtracklayer::import.gff("data/U12DB/u12_mouse.gff"))
+
+# instead look at overlap at the gene level. 
+u12_introns <-
+  u12_gff %>%
+  as.data.frame() %>%
+  as_tibble() %>%
+  mutate( group = as.integer(as.character(group)))
+
+u12 <- left_join(u12_data, u12_introns, by = c("id" = "group") )
+
+u12_genes <- u12_data$gene_name
+u12_genes <- u12_genes[ !is.na(u12_genes)]
+u12_genes <- unique(u12_genes)
+
+table(u12_genes %in% combined$gene_name)
+
+# 218 out of 617 u12 genes cannot be found in the differential expression table. fuck
+
+# try converting
+u12_convert <- stringr::str_to_title(gconvert(u12_genes, organism = "mmusculus")$name)
+
+table(u12_convert %in% combined$gene_name)
+
+# HGNC has a symbol checker - how well does it do?
+u12_hgnc_conversion <- read_csv("data/U12DB/u12db_genes_hgnc_converted.csv")
+
+u12_hgnc <- str_to_title(u12_hgnc_conversion$`Approved symbol`)
+u12_hgnc <- u12_hgnc[ !is.na(u12_hgnc)]
+u12_hgnc <- unique(u12_hgnc)
+
+table(u12_hgnc %in% combined$gene_name)
+# still only 460 out of the original 617.
+
+
+# how many of the u12 genes are significantly differentially expressed?
+combined$minor <- combined$gene_name %in% u12_hgnc
+
+
+
+# how many in each set?
+
+sig_minor <- 
+  map_df(gene_sets,~{
+    genes <- .x$gene_name
+    minor_genes <- genes %in% u12_hgnc
+    data.frame(n_genes = length(genes), n_overlap = sum(minor_genes))
+  }, .id = "set") %>%
+  mutate(condition = "sig")
+
+null_minor <- 
+  map_df(null_sets,~{
+    genes <- .x$gene_name
+    minor_genes <- genes %in% u12_hgnc
+    data.frame(n_genes = length(genes), n_overlap = sum(minor_genes))
+  }, .id = "set") %>%
+  mutate(condition = "null")
+
+all_minor <- 
+  rbind(sig_minor, null_minor) %>%
+  split(.$set)
+
+
+proportion_test <- function(data){
+  sig <- filter(data, condition == "sig")
+  null <- filter(data, condition == "null")
+  n_overlap <- c(sig$n_overlap, null$n_overlap)
+  n_genes <- c(sig$n_genes, null$n_genes)
+  p <- prop.test(x = n_overlap, n = n_genes, p = NULL)$p.value
+  
+  res <- rbind(sig,null)
+  res$prop <- res$n_overlap / res$n_genes
+  res$p <- c(p, NA)
+  return(res)
+}
+
+minor_proportion_test <- 
+  map_df(all_minor, proportion_test) %>%
+  mutate(q = p.adjust(p, method = "bonferroni"))
+
+
+to_plot <- 
+    minor_proportion_test %>%
+  tidyr::separate( set, into = c("set_name", "direction"), sep = "_" ) %>%
+  mutate(q = p.adjust(p, method = "bonferroni")) %>%
+  mutate(q = signif(q, digits = 2)) %>%
+  #mutate( prop = n_overlap / n_genes) %>%
+  mutate( direction = factor(direction, levels = c("UP", "DOWN"))) %>%
+  dplyr::select( set_name, direction, condition, n_genes, n_overlap, prop, q) %>%
+  mutate( q = ifelse( is.na(q), 1, q)) #%>%
+ # mutate( q = ifelse( q > 0.05, ".", q))
+  
+sig_to_plot <- filter(to_plot, condition == "sig")
+null_to_plot <- filter(to_plot, condition == "null")
+  
+label_point <- max(to_plot$prop)
+label_point <- label_point + (0.1*label_point)
+
+# make plot
+minor_gene_direction_set_plot <-
+  ggplot(sig_to_plot) + 
+  geom_col( 
+    aes( x = " ",
+         y = prop, fill = set_name
+         ), position = position_dodge() 
+    ) + 
+    geom_errorbar(
+      data = null_to_plot, 
+      aes(x = " ", ymin = prop, ymax = prop ), 
+      width = 1, colour = "black", linetype = 2 ) +
+  #geom_errorbar(data = null, aes(x = feature, ymin = prop, ymax = prop ), width = 1, colour = "black", linetype = 2 ) + # for null proportions
+  #ylab(expression(log[2]~enrichment)) +
+  scale_alpha_manual(values = c(1,0.5)) +
+  scale_fill_manual( values = c("Knockout specific" = "firebrick2", "Mutation specific" = "dodgerblue", "Overlapping" = "purple")) +
+  theme_bw() +
+  theme( panel.background = element_blank(),
+         panel.border = element_blank(),
+         panel.grid = element_blank(),
+         strip.background = element_blank(),
+         axis.line = element_line(colour = "black"),
+         axis.text = element_text(colour = "black"),
+         axis.title = element_text(colour = "black"),
+         plot.title = element_text(face = "bold")
+         ) +
+  guides(fill = FALSE) +
+  xlab("") +
+  ylab("Proportion of genes with minor introns") +
+  scale_y_continuous(expand = c(0, 0)) +
+  # sneaky
+  geom_point( aes(x = 1, y = label_point + (0.2*label_point) ),  colour = "white" ) +
+  geom_text( aes(x = 1, y = label_point, label = q), size = 2,nudge_x = 0.05 ) +
+  guides(alpha = FALSE)+
+  facet_wrap(~paste(set_name,direction), nrow = 3) +
+  coord_flip() +
+  labs(title = "B")
+
+minor_gene_direction_set_plot
+```
+
+
+```{r}
+# can I replicate the Reber result when I just compare all DEGs with all non-DEGs?
+combined$DEG <- ifelse(combined$status_relaxed != "None", "DEG", "non-DEG")
+combined$minor <- combined$gene_name %in% u12_hgnc
+chisq.test(table(combined$DEG == "DEG", combined$minor  ))
+
+combined %>% 
+  group_by(DEG) %>%
+  summarise( n_genes = n(), n_minor = sum(minor), prop = n_minor / n_genes ) %>%
+  ggplot( aes(x = DEG, y = prop)) + 
+  ylab("% genes with minor introns") +
+  geom_col() +
+  scale_y_continuous(labels = scales::percent) +
+  xlab("")
+
+
+# yes - so despite there being a general increase in minor introns in differentially expressed genes, 
+regulariseAllNull <- function(combined){
+# remake Reber plot but correct non-DEGs for length and expression
+  sig <- filter(combined, status_relaxed != "None")
+  matched_null <- filter(combined, status_relaxed == "None")
+  
+  sig_depth <- log10(sig$frattaBaseMean) 
+  
+  sig_depth_quartile1 <- summary(sig_depth)[2]
+  sig_depth_quartile3 <- summary(sig_depth)[5]
+  
+  matched_null <- filter(matched_null,
+                         frattaBaseMean >= 10^sig_depth_quartile1 &
+                           frattaBaseMean <= 10^sig_depth_quartile3
+  )
+  
+  sig_length <- log10(sig$gene_length) 
+  
+  sig_length_quartile1 <- summary(sig_length)[2]
+  sig_length_quartile3 <- summary(sig_length)[5]
+  
+  matched_null <- filter(matched_null,
+                         gene_length >= 10^sig_length_quartile1 &
+                           gene_length <= 10^sig_length_quartile3
+  )
+  matched_null$DEG <- "non-DEG\n(matched)"
+  return(matched_null)
+}
+
+matched_null <- regulariseAllNull(combined)
+
+deg_matched <- rbind(combined, matched_null)
+
+pairwise.prop.test(table(deg_matched$DEG, deg_matched$minor))
+
+# DEG vs non-DEG: P = 1e-16
+# DEG vs non-DEG (matched): P = 0.16 (holm correction)
+
+minor_gene_plot <-
+  deg_matched %>%
+  group_by(DEG) %>%
+  summarise(minor_prop = sum(minor)/ n() ) %>%
+  ggplot(aes(x = DEG, y = minor_prop)) +
+  ylab("% genes with minor introns") +
+  geom_col() +
+  scale_y_continuous(labels = scales::percent, limits = c(0,0.04), expand = c(0,0)) +
+  xlab("") +
+  geom_text(x = 1.5, y = 0.033, label = "P < 1e-16") +
+  geom_text(x = 2, y = 0.038, label = "P = 0.21") +
+  geom_segment(x = 1, xend = 2, y = 0.032, yend = 0.032 ) +
+  geom_segment(x = 1, xend = 3, y = 0.037, yend = 0.037) +
+  theme_classic() +
+  theme(axis.title = element_text(colour = "black"),
+        axis.text = element_text(colour = "black"),
+        axis.ticks = element_line(colour = "black"),
+  plot.title = element_text(face = "bold")) +
+  labs(title = "A")
+
+minor_gene_plot
+
+# is this an artifact of long genes?
+
+n_bins <- 100
+
+# bin genes by length and see how many are minor intron genes
+minor_length_plot <- 
+  combined %>%
+  arrange(gene_length) %>%
+  mutate(bin = ntile(x = gene_length, n = n_bins)) %>%
+  group_by(bin) %>%
+  summarise(prop = sum(minor) / nrow(combined)/n_bins) %>%
+  ggplot(aes(x = bin, y = prop)) +
+  geom_point() +
+  xlab("Genes binned from\nshortest to longest") +
+  ylab("Proportion containing minor introns") +  
+  theme_classic() +
+  theme(axis.title = element_text(colour = "black"),
+        axis.text = element_text(colour = "black"),
+        axis.ticks = element_line(colour = "black"),
+        plot.title = element_text(face = "bold")) +
+  labs(title = "C")
+
+# what about depth?
+# bin genes by length and see how many are minor intron genes
+minor_expression <-
+  combined %>%
+  arrange(frattaBaseMean) %>%
+  mutate(bin = ntile(x = frattaBaseMean, n = n_bins))
+
+minor_expression_plot <- 
+  minor_expression %>%
+  group_by(bin) %>%
+  summarise(prop = sum(minor) / nrow(combined)/n_bins, 
+            median_expression = median(frattaBaseMean), 
+            sd_expression = sd(frattaBaseMean) ) %>%
+  ggplot(aes(x = bin, y = prop)) +
+ # geom_errorbarh(
+  #  aes(xmin = median_expression - sd_expression,
+   #     xmax = median_expression + sd_expression)
+  #  ) +
+  geom_point() +
+  xlab("Genes binned from\nlowest to highest wildtype expression") +
+  ylab("Proportion containing minor introns") +
+  theme_classic() +
+  theme(axis.title = element_text(colour = "black"),
+        axis.text = element_text(colour = "black"),
+        axis.ticks = element_line(colour = "black"),
+        plot.title = element_text(face = "bold")
+        ) +
+  labs(title = "D")
+
+minor_multiplot <- 
+  minor_gene_plot  +
+  minor_gene_direction_set_plot +
+  minor_length_plot + minor_expression_plot +
+  plot_layout(nrow = 2,heights = c(3, 2))
+
+ggsave(plot = minor_multiplot, 
+       filename = "figures/Gene_Expression/Minor_intron_gene_expression_multiplot.pdf", 
+       width = 9, 
+       height = 9)
+```
+
+```{r}
+# double check long gene effect
+n_bins <- 10
+long_gene <-
+  combined %>%
+  split(.$status_relaxed) %>%
+  map_df( ~{
+    .x %>%
+    arrange(gene_length) %>%
+    # mutate(gene_length = sample(1:n() )) %>%
+    mutate(bin = ntile(x = gene_length, n = n_bins)) %>%
+    group_by(bin) %>%
+    summarise( 
+      n = n(),
+      mean_lfc_ko = mean(lfc_ko, na.rm=TRUE),
+               sd_lfc_ko = sd(lfc_ko, na.rm = TRUE),
+               sem_lfc_ko = sd_lfc_ko / sqrt(n()),
+          mean_lfc_mut = mean(lfc_mut, na.rm=TRUE),
+               sd_lfc_mut = sd(lfc_mut, na.rm = TRUE),
+               sem_lfc_mut = sd_lfc_mut / sqrt(n())
+      )
+  },.id = "group")
+
+
+
+    
+# ko fold changes    
+long_gene_ko_lfc <-
+  long_gene %>%
+  ggplot(aes(x = bin, y = mean_lfc_ko)) + 
+  geom_errorbar( 
+    aes(ymin = mean_lfc_ko - sem_lfc_ko, 
+        ymax = mean_lfc_ko + sem_lfc_ko, 
+        group = group), 
+    position = position_dodge(width = 0.5), width = 1) +
+  geom_point(aes(colour = group, group = group), 
+             position = position_dodge(width = 0.5), size = 2) +
+  geom_hline(yintercept = 0, linetype = 3) +
+  ylim(-0.25,0.25)
+
+long_gene_mut_lfc <-
+  long_gene %>%
+  ggplot(aes(x = bin, y = mean_lfc_mut)) + 
+  geom_errorbar( 
+    aes(ymin = mean_lfc_mut - sem_lfc_mut, 
+        ymax = mean_lfc_mut + sem_lfc_mut, 
+        group = group), 
+    position = position_dodge(width = 0.1), width = 1) +
+  geom_point(
+    aes(colour = group, group = group), 
+    position = position_dodge(width = 0.1), size = 2) +
+    geom_hline(yintercept = 0, linetype = 3) +
+  ylim(-0.25,0.25)
+  
+
+long_gene_ko_lfc + long_gene_mut_lfc
+
+# something weird about mutation specific genes - no long gene downregulation effect.
+# it looks like the inverse where short genes are upregulated
+
+# this is an artifact of there being more upregulated than downregulated genes in the mutation specific set.
+# there is still long gene downregulation, it's the baseline that is different.
+
+
+
+combined %>%
+  mutate( direction_ko = ifelse(lfc_ko > 0 , "KO_UP", "KO_DOWN")) %>%
+  mutate(direction_mut = ifelse(lfc_mut > 0 , "MUT_UP", "MUT_DOWN")) %>%
+  filter(!is.na(direction_ko), !is.na(direction_mut)) %>%
+  dplyr::select( gene_length, status_relaxed, direction_ko, direction_mut) %>%
+  tidyr::gather( key = "set", value = "group", -gene_length, -status_relaxed) %>%
+  ggplot( aes(x = group, y = log10(gene_length) ) ) +
+  geom_boxplot( aes(group = group, fill = status_relaxed), notch = TRUE) +
+  facet_wrap(~status_relaxed)
+
+
+# density plot
+combined %>%
+  mutate( direction_ko = ifelse(lfc_ko > 0 , "KO_UP", "KO_DOWN")) %>%
+  mutate(direction_mut = ifelse(lfc_mut > 0 , "MUT_UP", "MUT_DOWN")) %>%
+  filter(!is.na(direction_ko), !is.na(direction_mut)) %>%
+  dplyr::select( gene_length, status_relaxed, direction_ko, direction_mut) %>%
+  tidyr::gather( key = "set", value = "group", -gene_length, -status_relaxed) %>%
+  ggplot( aes(x = log10(gene_length))) +
+  geom_density( aes(fill = group), alpha = 0.5) +
+  facet_wrap(~status_relaxed+group)
+
+
+
+combined %>%
+  mutate(direction_ko = ifelse(lfc_ko > 0 , "ko_up", "ko_down"),
+         direction_mut = ifelse(lfc_mut > 0, "mut_up", "mut_down")) %>%
+  dplyr::select(gene_length, direction_ko, direction_mut) %>%
+  tidyr::gather(key = "set", value = "direction", -gene_length) %>%
+  ggplot( aes(x = direction, y = log10(gene_length) )) + 
+  geom_boxplot(notch = TRUE)
+# do anova on long gene decile and mean fold change
+# long_gene_decile <- combined %>%
+#   split(.$status_relaxed) %>%
+#   map_df(~{
+#     .x %>%
+#       filter(!is.na(gene_length)) %>%
+#       arrange(gene_length) %>%
+#       # mutate(gene_length = sample(1:n() )) %>%
+#       mutate(bin = ntile(x = gene_length, n = n_bins))
+#   }, .id = "group"
+#   ) %>% as.data.frame()
+# 
+# long_gene_anova <- (aov(long_gene_decile,formula = lfc_ko ~ group + bin))
+# summary(long_gene_anova)
+
+signed_zscore <- function(pvalue, log2fc){
+  signed.z <- ifelse(test = log2fc > 0,
+	  					yes = qnorm( (pvalue / 2)),
+	  					no = qnorm(pvalue / 2) )	
+}
+
+combined$z_ko <- signed_zscore(pvalue = combined$p_ko, log2fc = combined$lfc_ko)
+combined$z_mut <- signed_zscore(pvalue = combined$p_mut, log2fc = combined$lfc_mut)
+
+combined %>%
+  mutate(bin = ntile(z_ko, n = 100)) %>%
+  ggplot(aes( x = bin, y = log10(gene_length) ) ) +
+  geom_boxplot(aes(group = bin)) + 
+  facet_wrap(~status_relaxed)
+
+
+```
+
+```{r}
+
+```
+
+
+
+
+```{r}
+# testing
+
+overlap_up <- filter(combined, direction == "UP", status_relaxed == "Overlapping")
+null_overlap_up <- null_sets$Overlapping_UP
+
+boxplot(list(sig = log10(overlap_up$gene_length), null = log10(null_overlap_up$gene_length)),
+        main = "Gene length")
+
+boxplot(list(sig = log10(overlap_up$frattaBaseMean), null = log10(null_overlap_up$frattaBaseMean)),
+        main = "Expression")
+
+wilcox.test(log10(overlap_up$gene_length), log10(null_overlap_up$gene_length))
+wilcox.test(log10(overlap_up$frattaBaseMean), log10(null_overlap_up$frattaBaseMean))
+
+
+```
+
+
+Do the classification!
+
+```{r}
+
+
+clipOverlapByRegion <- function(mygene, annotations, iclip){
+  #message(mygene)
+  # done per gene
+  
+  gene <- annotations[ annotations$gene_name == mygene]
+  if(length(gene) == 0){
+    return(NULL)
+  }
+  gene_strand <- unique(strand(gene))
+  
+  # divide annotation into UTR and CDS
+  utr <- gene[gene$type == "UTR"]
+  cds <- gene[gene$type == "CDS"]
+  
+  # if no CDS or UTR - a lincRNA or something weird
+  if( length(cds) == 0 | length(utr) == 0){
+    return(NULL)
+  }
+  
+  # remove NMD transcripts as then all exons will be UTRs - stupid
+  utr <- utr[ utr$transcript_type != "nonsense_mediated_decay"]
+  utr <- utr[ !is.na(utr$tag) & utr$tag != "cds_end_NF"]
+  
+  # define exon as CDS that doesn't overlap with a UTR
+  overlapping <- findOverlaps(utr,cds)
+  # check that cds and utr do not overlap
+  stopifnot(nrow(overlapping) == 0)
+  
+  # reduce down overlapping utrs
+  utr_flat<- GenomicRanges::reduce(utr)
+  
+  # overlap utrs with a list of polyA sites - only 3'UTRs should overlap
+  utr_overlap <- GenomicRanges::findOverlaps(utr_flat, polyA_gtf)
+  
+  utr_3 <- utr_flat[ unique( queryHits(utr_overlap)),]
+  utr_5 <-  utr_flat[ -unique( queryHits(utr_overlap)),]
+  
+  # if no overlap found take the first to be 5' and the last to be 3'
+  if(length(utr_overlap) == 0){
+    if( gene_strand == "+"){
+      utr_5 <- utr_flat[1]
+      utr_3 <- utr_flat[length(utr_flat)]
+    }else{
+      utr_3 <- utr_flat[1]
+      utr_5 <- utr_flat[length(utr_flat)]
+    }
+  }
+  
+  # extend the 3'UTR 5kb downstream
+  if( gene_strand == "+"){
+    end(utr_3) <- end(utr_3) + 5000
+  }else{
+    start(utr_3) <- start(utr_3) - 5000
+  }
+  
+  # for introns, combine utrs and cds and find the gaps between
+  introns <- c(utr,cds)
+  introns <- GenomicRanges::gaps(introns)[-1]
+  
+  # define the upstream promoter region as 5kb upstream of the 5'UTR
+  upstream_promoter <- flank(utr_5, width = 5000)
+  upstream_promoter <- invertStrand(upstream_promoter)
+  
+  
+  # do overlaps
+  intron_overlap <- GenomicRanges::findOverlaps(introns, iclip)
+  cds_overlap <- GenomicRanges::findOverlaps(cds, iclip)
+  utr_5_overlap <- GenomicRanges::findOverlaps(utr_5, iclip)
+  utr_3_overlap <- GenomicRanges::findOverlaps(utr_3, iclip)
+  promoter_overlap <- GenomicRanges::findOverlaps(upstream_promoter, iclip)
+  
+  # store values
+  report <- tibble(
+    gene_name = mygene,
+    promoter_anti = length(queryHits(promoter_overlap)),
+    utr_5 = length(queryHits(utr_5_overlap)),
+    intron = length(queryHits(intron_overlap)),
+    exon = length(queryHits(cds_overlap)),
+    utr_3 = length(queryHits(utr_3_overlap))
+  )
+  return(report)
+}
+
+overlapGeneSet <- function(genes, setName, iclip_data){
+  # done on a set of genes
+  
+  # filter gtf to get just those genes
+  annotations <- gtf[ gtf$gene_name %in% genes]
+
+  genes <- genes[ !is.na(genes)]
+  # run function to do overlaps
+  per_gene_res <- purrr::map_df( 
+    genes, clipOverlapByRegion, annotations = annotations, iclip = iclip_data
+    )
+  
+  # create report
+  per_set_res <- tibble(
+    set_name = setName,
+    n_genes = length(genes),
+    n_promo= sum(per_gene_res$promoter_anti > 0),
+    n_5utr = sum(per_gene_res$utr_5 > 0),
+    n_intron = sum( per_gene_res$intron > 0),
+    n_exon = sum( per_gene_res$exon > 0),
+    n_3utr = sum( per_gene_res$utr_3 > 0)
+  )
+  return( list(per_gene = per_gene_res, per_set = per_set_res))
+}
+
+
+# for testing
+#gene_sets <- map(gene_sets, ~{.x[1:10,]})
+#gene_names <- unlist(map( gene_sets, ~{.x$gene_name}))
+
+gene_names <- purrr::map( gene_sets, "gene_name")
+set_names <- names(gene_sets)
+
+# FUS iCLIP - significant genes
+
+# future_map2 is parallelised
+results_fus <- 
+  furrr::future_map2( .x = gene_names, .y = set_names, ~{
+  overlapGeneSet(.x, .y, iclip_data = iclip_fus)
+}, .progress = TRUE
+)
+
+per_gene_results_fus <- map( results_fus, "per_gene")
+per_set_results_fus <- map_df(results_fus, "per_set")
+
+#save(per_gene_results, per_set_results, file = "results/02_DESeq/utr_binding.Rdata")
+
+# U2AF65 iCLIP
+results_u2af <- 
+  furrr::future_map2( .x = gene_names, .y = set_names, ~{
+  overlapGeneSet(.x, .y, iclip_data = iclip_u2af)
+}, .progress = TRUE
+)
+
+per_gene_results_u2af <- map( results_u2af, "per_gene")
+per_set_results_u2af <- map_df(results_u2af, "per_set")
+
+
+
+# NULLS
+
+null_gene_names <- purrr::map( null_sets, "gene_name")
+null_set_names <- names(null_sets)
+
+#gene_names <- map(gene_names, ~{head(.x,50)})
+
+# FUS
+
+null_results_fus <- 
+  future_map2( .x = null_gene_names, .y = null_set_names, ~{
+  overlapGeneSet(.x, .y, iclip_data = iclip_fus)
+}, .progress = TRUE
+)
+
+null_per_gene_results_fus <- map( null_results_fus, "per_gene")
+null_per_set_results_fus <- map_df(null_results_fus, "per_set")
+
+# U2AF65
+
+null_results_u2af <- 
+  future_map2( .x = null_gene_names, .y = null_set_names, ~{
+  overlapGeneSet(.x, .y, iclip_data = iclip_u2af)
+}, .progress = TRUE
+)
+
+null_per_gene_results_u2af <- map( null_results_u2af, "per_gene")
+null_per_set_results_u2af <- map_df(null_results_u2af, "per_set")
+
+
+
+save(
+  per_gene_results_fus,
+  per_set_results_fus,
+  per_gene_results_u2af,
+  per_set_results_u2af,
+  null_per_gene_results_fus,
+  null_per_set_results_fus,
+  null_per_gene_results_u2af,
+  null_per_set_results_u2af,
+  file = "results/02_DESeq/null_utr_binding.Rdata"
+)
+
+
+```
+
+Making the plot
+
+```{r}
+
+load("results/02_DESeq/null_utr_binding.Rdata")
+# do per gene as well - how many genes in each set have any overlap at all? boosts numbers
+per_gene_overlap <- function(gene_results, condition_name){
+  map_df( gene_results, ~{
+    res <- .x[,-1]
+    n_overlap <- sum(rowSums(res) > 0)
+    n_genes <- nrow(res)
+    tibble(n_overlap = n_overlap, n_genes = n_genes)
+  }, .id = "set_name") %>%
+    mutate(feature = "n_gene", condition = condition_name) %>%
+    select(set_name, feature, everything())
+}
+
+proportion_test <- function(data){
+  sig <- filter(data, condition == "sig")
+  null <- filter(data, condition == "null")
+  n_overlap <- c(sig$n_overlap, null$n_overlap)
+  n_genes <- c(sig$n_genes, null$n_genes)
+  p <- prop.test(x = n_overlap, n = n_genes, p = NULL)$p.value
+  
+  res <- rbind(sig,null)
+  res$prop <- res$n_overlap / res$n_genes
+  res$p <- c(p, p)
+  return(res)
+}
+
+# test enrichment vs null across genes
+
+fus_gene_results <- 
+  rbind(
+    per_gene_overlap(per_gene_results_fus, "sig"),
+    per_gene_overlap(null_per_gene_results_fus, "null")
+  ) %>%
+  split(.$set_name) %>%
+  map_df(proportion_test) 
+
+u2af_gene_results <- 
+  rbind(
+    per_gene_overlap(per_gene_results_u2af, "sig"),
+    per_gene_overlap(null_per_gene_results_u2af, "null")
+  ) %>%
+  split(.$set_name) %>%
+  map_df(proportion_test)
+# test enrichment across features
+per_feature_overlap <- function(feature_results, condition_name){
+    res <- 
+      feature_results %>%
+      tidyr::gather(key = "feature", value = "n_overlap", -set_name,-n_genes) %>%
+      mutate(condition = condition_name) %>%
+      select(set_name, feature, n_overlap, n_genes, condition )
+  return(res)
+}
+
+fus_feature_results <- 
+  rbind(
+    per_feature_overlap(per_set_results_fus, "sig"),
+    per_feature_overlap(null_per_set_results_fus, "null")
+  ) %>%
+  split(.$feature) %>%
+  map_df(~{
+    split(.x, .x$set_name) %>%
+      map_df(proportion_test)
+  })
+
+u2af_feature_results <- 
+  rbind(
+    per_feature_overlap(per_set_results_u2af, "sig"),
+    per_feature_overlap(null_per_set_results_u2af, "null")
+  ) %>%
+  split(.$feature) %>%
+  map_df(~{
+    split(.x, .x$set_name) %>%
+      map_df(proportion_test)
+  })
+# bind together feature and gene results
+
+fus_all_res <- rbind( fus_feature_results, fus_gene_results)
+u2af_all_res <- rbind( u2af_feature_results, u2af_gene_results)
+
+# #%>%
+#   tidyr::separate( set_name, into = c("set_name", "direction"), sep = "_" ) %>%
+#   split(.$set_name) %>%
+#   map_df( ~{
+#     p <- prop.test(x = .x$n_overlap, n = .x$n_genes, p = NULL)$p.value
+#     .x$pvalue <- c(p, p)
+#     .x
+#   })%>%
+#   mutate( feature = "gene") %>%
+#   mutate( pvalue = signif(pvalue, digits =2 ),prop = n_overlap / n_genes) %>%
+#   mutate( direction = factor(direction, levels = c("UP", "DOWN"))) %>%
+#   dplyr::select( set_name, direction, feature, n_genes, n_overlap, prop, pvalue)
+
+
+
+## ----------------- plot iCLIP enrichment per genomic feature
+
+proportion_plot <- function(results, protein ){
+  # prepare results
+  to_plot <- 
+    results %>%
+  tidyr::separate( set_name, into = c("set_name", "direction"), sep = "_" ) %>%
+  mutate( feature = gsub("n_", "", feature)) %>%
+  mutate(feature = case_when(
+    feature == "gene" ~ "gene",
+    feature == "promo" ~ "promoter\nantisense",
+    feature == "5utr" ~ "5`UTR",
+    feature == "3utr" ~ "3`UTR",
+    feature == "exon" ~ "exon",
+    feature == "intron" ~ "intron"
+  ) ) %>%
+  mutate(q = p.adjust(p, method = "bonferroni")) %>%
+  mutate(q = signif(q, digits = 2)) %>%
+  #mutate( prop = n_overlap / n_genes) %>%
+  mutate( direction = factor(direction, levels = c("UP", "DOWN"))) %>%
+  select( set_name, direction, condition, feature, n_genes, n_overlap, prop, q) %>%
+  mutate( feature = factor(feature, levels = rev(c("gene","promoter\nantisense","5`UTR", "exon", "intron", "3`UTR"))) ) %>%
+  mutate( q = ifelse( is.na(q), 1, q)) %>%
+  mutate( q = ifelse( q > 0.05, ".", q))
+  
+  sig <- filter(to_plot, condition == "sig")
+  null <- filter(to_plot, condition == "null")
+  
+  label_point <- max(to_plot$prop)
+  label_point <- label_point + (0.1*label_point)
+  
+  #return(sig)
+  
+  # make plot
+  ggplot(sig) + 
+  geom_col( 
+    aes( x = feature,
+         y = prop, fill = set_name
+         ), position = position_dodge() 
+    ) + 
+    geom_errorbar(
+      data = null, 
+      aes(x = paste(feature), ymin = prop, ymax = prop ), 
+      width = 1, colour = "black", linetype = 2 ) +
+  #geom_errorbar(data = null, aes(x = feature, ymin = prop, ymax = prop ), width = 1, colour = "black", linetype = 2 ) + # for null proportions
+  #ylab(expression(log[2]~enrichment)) +
+  scale_alpha_manual(values = c(1,0.5)) +
+  scale_fill_manual( values = c("Knockout specific" = "firebrick2", "Mutation specific" = "dodgerblue", "Overlapping" = "purple")) +
+  theme_bw() +
+  theme( panel.background = element_blank(),
+         panel.border = element_blank(),
+         panel.grid = element_blank(),
+         strip.background = element_blank(),
+         axis.line = element_line(colour = "black"),
+         axis.text = element_text(colour = "black"),
+         axis.title = element_text(colour = "black")
+         ) +
+  guides(fill = FALSE) +
+  xlab("") +
+  ylab("Proportion overlapping iCLIP peaks") +
+  scale_y_continuous(expand = c(0, 0)) +
+  # sneaky
+  geom_point( aes(x = feature, y = label_point + (0.2*label_point) ),  colour = "white" ) +
+  geom_text( aes(x = feature, y = label_point, label = q), size = 2,nudge_x = 0.05 ) +
+  guides(alpha = FALSE)+
+  facet_wrap(~paste(set_name,direction), nrow = 3) +
+  coord_flip() +
+  labs(title = protein)
+
+
+}
+
+fus_prop_plot <- proportion_plot(fus_all_res,protein = "FUS")
+u2af_prop_plot <- proportion_plot(u2af_all_res, protein = "U2AF65")
+
+ggsave(plot = fus_prop_plot, filename = "figures/Gene_Expression/FUS_iCLIP_feature_direction_proportions_normalised.pdf",
+       width = 4,
+       height = 6)
+
+ggsave(plot = u2af_prop_plot, filename = "figures/Gene_Expression/U2AF65_iCLIP_feature_direction_proportions_normalised.pdf",
+       width = 4,
+       height = 6)
+
+```
+
+
+
+
+
+
+
+
+
+```{r}
+
+per_feature_direction_proportion_plot <-
+  all_features %>%
+  ggplot( ) + 
+  geom_col( aes( x = feature, alpha = direction , y = prop, fill = set_name), position = position_dodge()) + 
+  #geom_errorbar(data = null, aes(x = feature, ymin = prop, ymax = prop ), width = 1, colour = "black", linetype = 2 ) + # for null proportions
+  facet_wrap(~set_name, nrow = 3) +
+  #ylab(expression(log[2]~enrichment)) +
+  scale_alpha_manual(values = c(1,0.5)) +
+  scale_fill_manual( values = c("Knockout specific" = "firebrick2", "Mutation specific" = "dodgerblue", "Overlapping" = "purple")) +
+  theme_bw() +
+  theme( panel.background = element_blank(),
+         panel.border = element_blank(),
+         panel.grid = element_blank(),
+         strip.background = element_blank(),
+         axis.line = element_line(colour = "black")
+         ) +
+  guides(fill = FALSE) +
+  xlab("") +
+  ylab("Proportion overlapping iCLIP peaks") +
+  scale_y_continuous(expand = c(0, 0)) +
+  geom_point( aes(x = feature, y = 0.37),  colour = "white" ) +
+  geom_text( aes(x = feature, y = 0.35, label = pvalue)) +
+  coord_flip()
+
+
+
+per_feature_direction_proportion_plot
+
+
+ggsave(per_feature_direction_proportion_plot, filename = "figures/Gene_Expression/iCLIP_feature_direction_proportions.pdf", height = 7, width = 4)
+#ggsave(proportion_plot, filename = "figures/Gene_Expression/iCLIP_feature_proportions.pdf", height = 6, width = 5)
+
+```
+
+```{r}
+# separate out RNA-binding genes, what do they look like?
+library(gProfileR)
+
+# fous on overlapping upregulated genes
+set <- per_gene_results$Overlapping_UP
+
+set <- left_join(set, biomart, by = "gene_name")
+gprofile <- gprofiler(set$EnsemblID, organism = "mmusculus")
+
+rna_genes <- 
+  filter(gprofile, term.name == "RNA binding") %>% 
+  pull(intersection) %>%
+  stringr::str_split( pattern = ",") %>%
+  unlist()
+
+set$rna_binding <- set$EnsemblID %in% rna_genes
+
+split(set, set$rna_binding) %>%
+  map_df( ~{
+    df <- .x
+    n <- nrow(df)
+    data.frame(
+    promoter_anti = sum(df$promoter_anti > 0) / n,
+    utr_5 = sum(df$utr_5 > 0) / n,
+    intron = sum(df$intron > 0) / n,
+    exon = sum(df$exon > 0) / n,
+    utr_3 = sum(df$utr_3 > 0) / n
+    )
+  }, .id = "RNA-binding")
+
+rna <- filter(set, rna_binding == TRUE)
+
+```
+
+
+<!-- ```{r} -->
+
+<!-- table(UTR_bound = combined$utr_binding, status = combined$status_relaxed, direction_up = combined$lfc_ko > 0) -->
+
+<!-- utr_expression <- combined %>% -->
+<!--   filter( padj_ko < 0.05 | padj_mut < 0.05) %>% -->
+<!--   dplyr::select( utr_binding, status = status_relaxed, direction = lfc_ko) %>% -->
+<!--   mutate(direction = ifelse(direction > 0, "UP", "DOWN")) %>% -->
+<!--   mutate(utr_binding = ifelse(utr_binding == TRUE, "bound", "unbound")) %>% -->
+<!--   group_by(status, direction, utr_binding) %>% -->
+<!--   summarise( n = n()) %>% -->
+<!--   spread(utr_binding, n ) %>% -->
+<!--   mutate(ratio = bound / (unbound + bound) ) %>% -->
+<!--   mutate(conf_min = prop.test(x = bound, n = (bound + unbound))$conf.int[1] ) %>% -->
+<!--   mutate(conf_max = prop.test(x = bound, n = (bound + unbound))$conf.int[2] ) -->
+
+
+<!-- ggplot(utr_expression, aes( x=direction, y = ratio)) +  -->
+<!--   geom_errorbar(aes(ymin = conf_min, ymax = conf_max), width = 0.5 ) + -->
+<!--   geom_col() +  -->
+<!--   facet_wrap(~status) + -->
+<!--   coord_flip() + -->
+<!--   theme(strip.background = element_blank()) + -->
+<!--   #geom_text(aes(label = pvalue, y = 0.22, x = type), size = 3) + -->
+<!--   #geom_point( aes(y = 0.3, x = 1.5), colour = NA) + -->
+<!--   theme(strip.text.y = element_text(face = "bold",angle = 0)) + -->
+<!--   #labs(title = unique(group_name) ) + -->
+<!--   scale_y_continuous(expand = c(0, 0), position = "right") + -->
+<!--   #scale_x_discrete() + -->
+<!--   guides(alpha = FALSE)  + -->
+<!--   theme_classic() -->
+<!-- #  -->
+<!-- # combined$max_lfc <- ifelse( abs(combined$lfc_ko) > abs(combined$lfc_mut), combined$lfc_ko, combined$lfc_mut) -->
+<!-- # combined$min_p <- ifelse( combined$p_ko < combined$p_mut, combined$p_ko, combined$p_mut) -->
+<!-- #  -->
+<!-- # combined %>% -->
+<!-- #   #filter(utr_binding == TRUE) %>% -->
+<!-- # ggplot( aes(x = max_lfc, y = -log10(min_p) ) ) +  -->
+<!-- #   geom_point( aes(colour = utr_binding) ) +  -->
+<!-- #           facet_wrap(~status_relaxed) -->
+
+<!-- ``` -->
+
+<!-- ```{r} -->
+<!-- load("data/SGSeq/joint_analysis/novel_events/processed_all_joint_functionality.Rdata") -->
+
+<!-- res.clean$utr_binding <- res.clean$geneName %in% fus_utr_genes$EnsemblID -->
+
+
+
+<!-- res.sig <- filter(res.clean, padj < 0.05) -->
+<!-- res.sig$utr_binding <- res.sig$geneName %in% fus_utr_genes$EnsemblID -->
+
+
+<!-- table(binding = res.sig$utr_binding, -->
+<!--       significant = (res.sig$group), -->
+<!--       type = res.sig$type)  -->
+
+<!-- ``` -->
+
+
+# individual plots
+# 
+# per_set_proportion_plot <- 
+#   all_features %>%
+#   ggplot( aes( x = set_name, y = prop)) +
+#   geom_col( aes( alpha = direction, fill = set_name), position = position_dodge()) +
+#   xlab("") +
+#   ylab("Proportion with iCLIP peaks") +
+#   geom_text( aes(y = 0.245, x = set_name, label = pvalue)) +
+#   geom_point( aes( y = 0.25, x = set_name), colour = "white") +
+#   scale_alpha_manual(values = c(1,0.5)) +
+#   scale_fill_manual( values = c("Knockout specific" = "firebrick2", "Mutation specific" = "dodgerblue", "Overlapping" = "purple")) +
+#   theme_bw() +
+#   theme( panel.background = element_blank(),
+#          panel.border = element_blank(),
+#          panel.grid = element_blank(),
+#          strip.background = element_blank(),
+#          axis.line = element_line(colour = "black")
+#          ) +
+#   guides(fill = FALSE) 

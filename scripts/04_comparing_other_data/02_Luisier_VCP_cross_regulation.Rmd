@@ -1,0 +1,336 @@
+---
+title: "Luisier FUS intron retention"
+author: "Jack Humphrey"
+date: "08/02/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "~/google_drive/Work/PhD_Year_4/FUS_meta-analysis/")
+library(readr)
+library(tidyr)
+library(purrr)
+library(dplyr)
+library(stringr)
+library(SGSeq)
+library(ggplot2)
+library(patchwork)
+library(ggbeeswarm)
+```
+
+## Extract FUS RI PSIs from Luisier
+
+```{r}
+load("data/Luisier_VCP/Luisier_sgv_novel.RData")
+
+support <- read_tsv("data/Luisier_VCP/Luisier_support.tab")
+
+# info on which event is where is in mcols(sgvc_novel)
+events <- as.data.frame(mcols(sgvc_novel))
+
+createCoords <- function(from, to){
+  fromSplit <- str_split_fixed(from, ":", 4)
+  toSplit <- str_split_fixed(to, ":", 4)
+  coord <- ifelse( toSplit[,4] == "+", 
+                   yes = paste0( toSplit[,2], ":", fromSplit[,3], "-", toSplit[,3]),
+                   no = paste0( toSplit[,2], ":", toSplit[,3], "-", fromSplit[,3]) 
+  ) 
+}
+
+events$coords <- createCoords(events$from, events$to) 
+
+# map out which variantIDs correspond to each intron
+# 3 - intron 6 exclusion
+# 4 - intron 6 retention
+# 5 - intron 7 exclusion
+# 6 - intron 7 retention
+
+counts <- counts(sgvc_novel)
+
+# test - CTRL_1_control_d14_1 should have more retention than CTL_1_control_d7_1
+#counts[3:6, c("CTRL_1_control_d14_1", "CTRL_1_control_d7_1")]
+
+# get counts
+
+fus_ri <- as.data.frame(t(counts[3:6,]))
+names(fus_ri) <- c("i6_exclusion", "i6_retention", "i7_exclusion", "i7_retention")
+
+fus_ri$i6_PSI <- fus_ri$i6_retention / (fus_ri$i6_exclusion  + fus_ri$i6_retention)
+fus_ri$i7_PSI <- fus_ri$i7_retention / (fus_ri$i7_exclusion + fus_ri$i7_retention)
+
+# match in samples
+# convert day to a factor
+results <- as_tibble(fus_ri, rownames = "sample") %>%
+  left_join(support, by = "sample") %>%
+  filter(day != 112) %>%
+  mutate(day = as.character(day)) %>%
+  mutate(day = factor(day, levels = c("0", "7", "14","21","35")))
+
+means <- group_by(results, day, genotype2) %>%
+  summarise(i6_mean = mean(i6_PSI), i7_mean = mean(i7_PSI))
+
+```
+
+Stats!
+
+```{r}
+
+# stats!
+
+i6_anova <- aov(formula = i6_PSI ~ genotype2 : day, data = results)
+summary(i6_anova)
+
+i7_anova <- aov(formula = i7_PSI ~ genotype2 : day , data = results)
+summary(i7_anova)
+
+i6_tukey <- TukeyHSD(i6_anova, ordered =FALSE)$`genotype2:day`
+
+i6_tukey_results <-
+  i6_tukey[c(
+  "VCP:0-control:0",
+  "VCP:7-control:7",
+    "VCP:14-control:14",
+  "VCP:21-control:21",
+    "VCP:35-control:35"
+  ),] %>%
+  as.data.frame()
+
+i7_tukey <- TukeyHSD(i7_anova, ordered =FALSE)$`genotype2:day`
+
+i7_tukey_results <- 
+  i7_tukey[c(
+  "VCP:0-control:0",
+  "VCP:7-control:7",
+    "VCP:14-control:14",
+  "VCP:21-control:21",
+    "VCP:35-control:35"
+  ),] %>%
+  as.data.frame()
+
+i6_tukey_results$day <- factor(c("0","7","14","21","35"), levels = c("0","7","14","21","35"))
+i6_tukey_results$q <- signif(i6_tukey_results$`p adj`, digits = 2)
+
+i7_tukey_results$day <- factor(c("0","7","14","21","35"), levels = c("0","7","14","21","35"))
+i7_tukey_results$q <- signif(i7_tukey_results$`p adj`, digits = 2)
+
+# TukeyHSD may be too conservative as its correcting for every possible combination, whereas I know which comparisons I want.
+
+i6_t.test <- 
+  results %>%
+  split(.$day) %>%
+  map_df(~{
+    p <- pairwise.t.test(.x$i6_PSI, g = .x$genotype2)$p.value
+    tibble(p = as.numeric(p))
+  }, .id = "day")
+
+i7_t.test <- 
+  results %>%
+  split(.$day) %>%
+  map_df(~{
+    p <- pairwise.t.test(.x$i7_PSI, g = .x$genotype2)$p.value
+    tibble(p = as.numeric(p))
+  }, .id = "day") %>%
+  mutate( day = factor(as.character(day), levels = c("0","7","14","21","35") )) %>%
+  mutate(q = p.adjust(p, method = "bonferroni")) %>%
+  mutate(q = signif(q, digits = 2))
+
+# t-test with Bonferroni correction is actually worse!
+
+```
+
+
+
+
+Plotting!
+
+```{r}
+
+# i6
+i6_psi_plot <-
+  results %>%
+ ggplot( aes(x = day ) ) +
+  geom_beeswarm(aes(y = i6_PSI, colour = genotype2, group = genotype2), dodge.width = 0.75,priority = "ascending",cex = 2 ) +
+  geom_errorbar(data = means, aes(x = day, ymin = i6_mean, ymax = i6_mean, group = genotype2 ), width = 0.5, position = position_dodge(width = 0.75) ) +
+  scale_y_continuous(breaks = c(0,0.25,0.5,1), limits = c(0,1.1)) +
+  ylab("Percentage spliced in") +
+  labs(title = "FUS intron 6") +
+  scale_colour_manual(values = c("control" = "grey", "VCP" = "forestgreen")) +
+  theme_bw() +
+  theme(
+    text = element_text(colour = "black"),
+    panel.background = element_rect(colour = "black"),
+    panel.grid = element_blank(),
+    axis.ticks = element_line(colour = "black"),
+    panel.spacing.x = unit(0, "lines"),
+    panel.border = element_rect(colour = "black")
+  ) +
+  guides(colour = FALSE) +
+  geom_text( data = i6_tukey_results, aes(x = day, y = 1.05, label = q))
+
+# i7
+i7_psi_plot <-
+  results %>%
+  filter(day != 112) %>%
+  mutate(day = as.character(day)) %>%
+  mutate(day = factor(day, levels = c("0", "7", "14","21","35"))) %>%
+ ggplot( aes(x = day ) ) +
+  geom_beeswarm(aes(y = i7_PSI, colour = genotype2, group = genotype2), dodge.width = 0.75,priority = "ascending",cex = 2 ) +
+  geom_errorbar(data = means, aes(x = day, ymin = i7_mean, ymax = i7_mean, group = genotype2 ), width = 0.5, position = position_dodge(width = 0.75) ) +
+  scale_y_continuous(breaks = c(0,0.25,0.5,1), limits = c(0,1.1)) +
+  ylab("Percentage spliced in") +
+  labs(title = "FUS intron 7") +
+  theme_bw() +
+  theme(
+    text = element_text(colour = "black"),
+    panel.background = element_rect(colour = "black"),
+    panel.grid = element_blank(),
+    axis.ticks = element_line(colour = "black"),
+    panel.spacing.x = unit(0, "lines"),
+    panel.border = element_rect(colour = "black")
+  ) +
+  scale_colour_manual(values = c("control" = "grey", "VCP" = "forestgreen")) +
+  guides(colour = FALSE) +
+  geom_text( data = i7_tukey_results, aes(x = day, y = 1.05, label = q))
+
+multiplot <- i6_psi_plot + i7_psi_plot + plot_layout(ncol = 2)
+
+multiplot
+ggsave(plot = multiplot, filename = "figures/Autoregulation/Luisier_FUS_RI_PSI.pdf", height = 4, width = 7)
+
+```
+
+
+# SOD1 from Kevin Eggan
+
+Raphaelle also used SOD1 data from Kevin Eggan's group and reported FUS intron retention changes.
+How do they look?
+
+```{r}
+
+load("data/Eggan_SOD1/Eggan_SOD1_sgv_novel.RData")
+
+support <- read_tsv("data/Eggan_SOD1/Eggan_SOD1_support.tab")
+
+# info on which event is where is in mcols(sgvc_novel)
+events <- as.data.frame(mcols(sgvc_novel))
+
+createCoords <- function(from, to){
+  fromSplit <- str_split_fixed(from, ":", 4)
+  toSplit <- str_split_fixed(to, ":", 4)
+  coord <- ifelse( toSplit[,4] == "+", 
+                   yes = paste0( toSplit[,2], ":", fromSplit[,3], "-", toSplit[,3]),
+                   no = paste0( toSplit[,2], ":", toSplit[,3], "-", fromSplit[,3]) 
+  ) 
+}
+
+events$coords <- createCoords(events$from, events$to) 
+
+# map out which variantIDs correspond to each intron
+# 3 - intron 6 exclusion
+# 6 - intron 6 retention
+# 7 - intron 7 exclusion
+# 8 - intron 7 retention
+
+counts <- counts(sgvc_novel)
+
+# test - CTRL_1_control_d14_1 should have more retention than CTL_1_control_d7_1
+#counts[3:6, c("CTRL_1_control_d14_1", "CTRL_1_control_d7_1")]
+
+# get counts
+
+fus_ri <- as.data.frame(t(counts[c(3,6,7,8),]))
+names(fus_ri) <- c("i6_exclusion", "i6_retention", "i7_exclusion", "i7_retention")
+
+fus_ri$i6_PSI <- fus_ri$i6_retention / (fus_ri$i6_exclusion  + fus_ri$i6_retention)
+fus_ri$i7_PSI <- fus_ri$i7_retention / (fus_ri$i7_exclusion + fus_ri$i7_retention)
+
+# match in samples
+# convert day to a factor
+results <- as_tibble(fus_ri, rownames = "sample") %>%
+  left_join(support, by = "sample") #%>%
+  #filter(day != 112) %>%
+  #mutate(day = as.character(day)) %>%
+  #mutate(day = factor(day, levels = c("0", "7", "14","21","35")))
+
+means <- group_by(results, genotype) %>%
+  summarise(i6_mean = mean(i6_PSI), i7_mean = mean(i7_PSI))
+
+```
+
+
+P-values
+
+```{r}
+sgseq_results <- read_tsv("data/Eggan_SOD1/Eggan_SOD1_CTL_SOD1_A4V_res_clean_novel.tab")
+i6 <- "chr16:31185179-31186802"
+i7 <- "chr16:31186836-31188325"
+
+i6_res <- filter(sgseq_results, coords == i6, variantType == "RI:R")
+i7_res <- filter(sgseq_results, coords == i7, variantType == "RI:R")
+
+```
+
+
+
+Plotting!
+
+```{r}
+
+i6_psi_plot <-
+  results %>%
+ ggplot( aes(x = "" ) ) +
+  geom_beeswarm(aes(y = i6_PSI, colour = genotype, group = genotype), dodge.width = 0.75,priority = "ascending",cex = 2 ) +
+  geom_errorbar(data = means, aes(x = "", ymin = i6_mean, ymax = i6_mean, group = genotype ), width = 0.5, position = position_dodge(width = 0.75) ) +
+  scale_y_continuous(breaks = c(0,0.25,0.5,1), limits = c(0,1.1)) +
+  ylab("Percentage spliced in") +
+  labs(title = "FUS intron 6") +
+  scale_colour_manual(values = c("CTL" = "black", "SOD1_A4V" = "magenta")) +
+  theme_bw() +
+  theme(
+    text = element_text(colour = "black"),
+    panel.background = element_rect(colour = "black"),
+    panel.grid = element_blank(),
+    axis.ticks = element_line(colour = "black"),
+    panel.spacing.x = unit(0, "lines"),
+    panel.border = element_rect(colour = "black")
+  ) +
+  guides(colour = FALSE) +
+  annotate(geom = "text", x = "", y = 1.05, label = signif( i6_res$pvalue, digits = 2) )
+
+i6_psi_plot
+
+# i7
+i7_psi_plot <-
+  results %>%
+  #filter(day != 112) %>%
+  #mutate(day = as.character(day)) %>%
+  #mutate(day = factor(day, levels = c("0", "7", "14","21","35"))) %>%
+ ggplot( aes(x = "" ) ) +
+  geom_beeswarm(aes(y = i7_PSI, colour = genotype, group = genotype), dodge.width = 0.75,priority = "ascending",cex = 2 ) +
+  geom_errorbar(data = means, aes(x = "", ymin = i7_mean, ymax = i7_mean, group = genotype ), width = 0.5, position = position_dodge(width = 0.75) ) +
+  scale_y_continuous(breaks = c(0,0.25,0.5,1), limits = c(0,1.1)) +
+  ylab("Percentage spliced in") +
+  labs(title = "FUS intron 7") +
+  theme_bw() +
+  theme(
+    text = element_text(colour = "black"),
+    panel.background = element_rect(colour = "black"),
+    panel.grid = element_blank(),
+    axis.ticks = element_line(colour = "black"),
+    panel.spacing.x = unit(0, "lines"),
+    panel.border = element_rect(colour = "black")
+  ) +
+  scale_colour_manual(values = c("CTL" = "black", "SOD1_A4V" = "magenta")) +
+  guides(colour = FALSE) +
+  annotate(geom = "text", x = "", y = 1.05, label = signif( i7_res$pvalue, digits = 2) )
+
+i7_psi_plot
+
+multiplot <- i6_psi_plot + i7_psi_plot + plot_layout(ncol = 2)
+
+multiplot
+ggsave(plot = multiplot, filename = "figures/Autoregulation/Eggan_SOD1_PSI.pdf", height = 4, width = 4)
+
+```
+

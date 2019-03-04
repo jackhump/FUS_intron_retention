@@ -1,0 +1,359 @@
+---
+title: "Autoregulation Validation"
+author: "Jack Humphrey"
+date: "07/09/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "~/google_drive/Work/PhD_Year_4/FUS_meta-analysis/")
+library(tidyverse)
+library(ggbeeswarm)
+library(broom)
+library(patchwork)
+```
+
+# RT-PCR of FUS intron retention
+In mouse embryo spinal cord
+
+```{r rt-pcr}
+
+data <- readr::read_csv("Validation/mFUS_PCR_results/for R-Table 1.csv")
+
+# clean data
+data <- 
+  data %>%
+  mutate( PSI = intron/ (exon + intron)) %>%
+  mutate(intron_number = ifelse(intron_number == 6, "Intron 6", "Intron 7")) %>%
+  mutate( Genotype = case_when( Genotype == "WT" ~ "CTL",
+                                Genotype == "HET" ~ "MUT\nHET",
+                                Genotype == "HOM" ~ "MUT\nHOM" )) %>%
+  mutate( Genotype = factor(Genotype, levels = c("CTL", "MUT\nHET", "MUT\nHOM")))
+  
+
+# get means
+means <-
+  data %>%
+  group_by( Genotype, intron_number) %>%
+  summarise( mean = mean(PSI)) %>%
+  ungroup()
+
+
+cols <- c("CTL" = "darkgray", 
+          "MUT" = "dodgerblue3", "MUT\nHET" = "dodgerblue", "MUT\nHOM" = "dodgerblue3" )
+
+
+scatterplot <- 
+  data %>%
+  ggplot() + 
+  geom_beeswarm( aes(x = Genotype, y = PSI,colour = Genotype),priority = "ascending",cex = 3) +
+  geom_errorbar(data = means, aes(x = Genotype, ymin = mean, ymax = mean ), width = 0.5 ) +
+  facet_wrap(~intron_number) +
+  guides(colour = FALSE) +
+  xlab("") +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    strip.background = element_rect(colour="black", fill="white")) +
+  scale_colour_manual(values = cols) +
+  ylim(0,0.5) +
+  theme(text = element_text(colour = "black"),
+        panel.background = element_rect(colour = "black"),
+    panel.grid = element_blank(),
+        #axis.title.y=element_blank(),
+        panel.spacing.x = unit(0, "lines"),
+        panel.border = element_rect(colour = "darkgrey"),
+        #axis.line = element_line(colour = "black"),
+        #axis.text.y=element_blank(),
+        #axis.ticks.y=element_blank(),
+        plot.title = element_text(face = "italic",hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        strip.background = element_blank()
+  ) + ylab("Percentage intron retention")
+
+scatterplot
+ggsave("figures/Autoregulation/rt_pcr_validation_both_introns_psi_plot.pdf",plot = scatterplot, width = 4, height = 3)
+
+```
+
+Statistics
+
+```{r}
+
+rt_anova_tukey <- function( intron){
+  df <- data[ data$intron_number == intron,]
+  anova <- aov( PSI ~ Genotype, data =df)
+  anova_res <- tidy(anova)
+  tukey <- TukeyHSD(anova)
+  # pairwise t-test
+  t_tests <- pairwise.t.test(x = df$PSI, g = gsub("\n","", df$Genotype), p.adjust.method = "holm" )
+  
+  return(list(
+    anova = anova_res,
+    tukey = tukey,
+    t_tests = t_tests
+  ))
+}
+
+i6 <- rt_anova_tukey("Intron 6")
+i7 <- rt_anova_tukey("Intron 7")
+
+```
+
+
+
+# RT-PCR with cycloheximide treatment
+In mouse embryonic fibroblasts
+
+```{r}
+# --------- Cycloheximide tratement
+
+df <- readxl::read_excel("Validation/Robaldo_mouse_CHX/CHX_results.xlsx")
+
+df <- 
+  df %>%
+  mutate( PSI = intron/ (exon + intron)) %>%
+  mutate(intron_number = case_when(intron_number == 6 ~ "Intron 6",
+                                   intron_number == 7 ~ "Intron 7",
+                                   intron_number == "Srsf7" ~ "Srsf7")) %>%
+  mutate( Genotype = case_when( Genotype == "WT" ~ "CTL",
+                                #Genotype == "HET" ~ "MUT\nHET",
+                                Genotype == "HOM" ~ "MUT\nHOM" )) %>%
+  mutate( Genotype = factor(Genotype, levels = c("CTL", "MUT\nHOM"))) %>%
+  tidyr::unite(col = "Condition", Genotype, Treatment, sep = "\n\n", remove = FALSE)
+
+means <-
+  df %>%
+  group_by( Genotype, intron_number, Treatment) %>%
+  summarise( mean = mean(PSI)) %>%
+  tidyr::unite(col = "Condition", Genotype, Treatment, sep = "\n\n", remove = FALSE ) %>%
+  ungroup()
+
+cols <- c("CTL" = "darkgray", 
+          "MUT" = "dodgerblue3", "MUT\nHET" = "dodgerblue", "MUT\nHOM" = "dodgerblue3" )
+
+full <- left_join(df, means)
+
+fus_chx <- 
+  full %>%
+  filter(intron_number != "Srsf7") 
+
+srsf7_chx <- 
+  full %>%
+  filter(intron_number == "Srsf7")
+
+CHX_plot <- function(res){
+  ggplot(data = res) + 
+  geom_beeswarm( aes(x = Condition, y = PSI,colour = Genotype),priority = "ascending",cex = 5) +
+  geom_errorbar( aes(x = Condition, ymin = mean, ymax = mean ), width = 0.5 ) +
+  facet_wrap(~intron_number) +
+  guides(colour = FALSE) +
+  xlab("") +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+   # strip.background = element_rect(colour="black", fill="white"),
+    strip.background = element_blank(),
+   axis.text.x = element_text(colour = "black")) +
+  scale_colour_manual(values = cols) +
+  coord_cartesian(#ylim = c(0, 0.12), # This focuses the x-axis on the range of interest
+                  clip = 'off' # This keeps the labels from disappearing
+  ) +
+  geom_text( aes( x = Condition, y = -0.03, label = Treatment ) ) +
+  annotate(geom = "text", x = -0.01, y = -0.03, label = "CHX") +
+  scale_x_discrete(labels = c("CTL\n","CTL\n","MUT\n","MUT\n"))
+}
+
+chx_plot_full <-
+  {CHX_plot(fus_chx) + scale_y_continuous(breaks = c(0, 0.05, 0.1), limits = c(0,0.15) )} +
+  {CHX_plot(srsf7_chx) + scale_y_continuous(breaks = c(0,0.5,1), limits = c(0,1.3)) } +
+  plot_layout(widths = c(2,1))
+
+chx_plot_full
+
+ggsave("figures/Autoregulation/cycloheximide_quantification.pdf", plot = chx_plot_full, width = 6, height = 3)
+
+
+```
+
+Stats 
+```{r}
+# stats - do anovas
+
+anova_tukey_chx <- function( intron){
+  df <- full[ full$intron_number == intron,]
+  anova <- aov( PSI ~ Genotype * Treatment, data =df)
+  anova_res <- tidy(anova)
+  tukey <- TukeyHSD(anova)
+  # pairwise t-test
+  t_tests <- pairwise.t.test(x = df$PSI, g = gsub("\n","", df$Condition) )
+  
+  return(list(
+    anova = anova_res,
+    tukey = tukey,
+    t_tests = t_tests
+  ))
+}
+
+anova_tukey_chx( "Srsf7")
+anova_tukey_chx("Intron 6")
+anova_tukey_chx("Intron 7")
+
+```
+
+
+# RT-PCR on human
+
+```{r}
+human_pcr <- readxl::read_excel(path = "Validation/Robaldo_human_PCR/human_PCR_david_carmelo.xlsx")
+
+df <- 
+  human_pcr %>%
+  mutate( PSI = intron/ (exon + intron)) %>%
+  mutate(intron_number = case_when(intron_number == 6 ~ "Intron 6",
+                                   intron_number == 7 ~ "Intron 7"
+                                   )) %>%
+  
+  mutate( Genotype = factor(Genotype, levels = c("WT", "MUT")))
+
+means <-
+  df %>%
+  group_by( Genotype, intron_number) %>%
+  summarise( mean = mean(PSI), sd = sd(PSI))
+
+cols <- c("WT" = "darkgray", 
+          "MUT" = "dodgerblue3" )
+
+
+anova_tukey <- function( intron){
+  test_df <- df[ df$intron_number == intron,]
+  anova <- aov( PSI ~ Genotype, data = test_df)
+  anova_res <- tidy(anova)
+  tukey <- TukeyHSD(anova)
+  # pairwise t-test
+  t_tests <- pairwise.t.test(x = test_df$PSI, g = test_df$Genotype )
+  
+  return(list(
+    anova = anova_res,
+    tukey = tukey,
+    t_tests = t_tests
+  ))
+}
+
+i6_anova_p <- signif( anova_tukey("Intron 6")$anova$p.value[1], digits = 3)
+i7_anova_p <- signif( anova_tukey("Intron 7")$anova$p.value[1], digits = 3)
+
+
+scatterplot <- 
+  df %>%
+  ggplot() + 
+  geom_beeswarm( aes(x = Genotype, y = PSI,colour = Genotype), priority = "ascending",cex = 3) +
+  geom_errorbar(data = means, aes(x = Genotype, ymin = mean, ymax = mean ), width = 0.5 ) +
+  facet_wrap(~intron_number) +
+  guides(colour = FALSE) +
+  xlab("") +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    strip.background = element_rect(colour="black", fill="white")) +
+  scale_colour_manual(values = cols) +
+  ylim(0,0.23) +
+  theme(text = element_text(colour = "black"),
+        panel.background = element_rect(colour = "black"),
+    panel.grid = element_blank(),
+        #axis.title.y=element_blank(),
+        panel.spacing.x = unit(0, "lines"),
+        panel.border = element_rect(colour = "darkgrey"),
+        #axis.line = element_line(colour = "black"),
+        #axis.text.y=element_blank(),
+        #axis.ticks.y=element_blank(),
+        plot.title = element_text(face = "italic",hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        strip.background = element_blank()
+  ) + ylab("Percentage intron retention")
+#scatterplot
+
+ggsave("figures/Autoregulation/human_rt_pcr_psi_plot.pdf",plot = scatterplot, width = 4, height = 3)
+
+```
+
+# Fractionation
+
+```{r}
+fractionation_pcr <- readxl::read_excel(path = "Validation/Milioto_Fractionation/fractionation_rt_pcr_tidy.xlsx")
+
+df <-
+  fractionation_pcr %>%
+  mutate( PSI = intron/ (exon + intron)) %>%
+  mutate(intron_number = case_when(intron_number == 6 ~ "Intron 6",
+                                   intron_number == 7 ~ "Intron 7"
+                                   )) %>%
+  
+  mutate( Genotype = factor(Genotype, levels = c("WT", "MUT"))) %>%
+  mutate(condition = paste0(Genotype,"\n",fraction)) %>%
+  mutate(condition = factor(condition, levels = c("WT\nNuc", "WT\nCyt", "MUT\nNuc","MUT\nCyt")))
+
+means <-
+  df %>%
+  group_by( condition, fraction, intron_number) %>%
+  summarise( mean = mean(PSI), sd = sd(PSI))
+
+cols <- c("WT\nNuc" = "darkgray",
+          "WT\nCyt" = "darkgray",
+          "MUT\nNuc" = "dodgerblue3",
+          "MUT\nCyt" = "dodgerblue3" )
+
+
+fract_scatterplot <- 
+  df %>%
+  ggplot() + 
+  geom_beeswarm( aes(x = condition, y = PSI,colour = condition), priority = "ascending",cex = 3) +
+  geom_errorbar(data = means, aes(x = condition, ymin = mean, ymax = mean ), width = 0.5 ) +
+  facet_wrap(~intron_number) +
+  guides(colour = FALSE) +
+  xlab("") +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    strip.background = element_rect(colour="black", fill="white")) +
+  scale_colour_manual(values = cols) +
+  ylim(0,0.5) +
+  theme(text = element_text(colour = "black"),
+        panel.background = element_rect(colour = "black"),
+    panel.grid = element_blank(),
+        #axis.title.y=element_blank(),
+        panel.spacing.x = unit(0, "lines"),
+        panel.border = element_rect(colour = "darkgrey"),
+        #axis.line = element_line(colour = "black"),
+        #axis.text.y=element_blank(),
+        #axis.ticks.y=element_blank(),
+        plot.title = element_text(face = "italic",hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        strip.background = element_blank()
+  ) + ylab("Percentage intron retention")
+
+fract_scatterplot
+
+anova_tukey_fractionation <- function( intron){
+  test_df <- df[ df$intron_number == intron,]
+  anova <- aov( PSI ~ Genotype * fraction, data = test_df)
+  anova_res <- tidy(anova)
+  tukey <- TukeyHSD(anova)
+  # pairwise t-test
+  t_tests <- pairwise.t.test(x = test_df$PSI, g = test_df$condition )
+  
+  return(list(
+    anova = anova_res,
+    tukey = tukey,
+    t_tests = t_tests
+  ))
+}
+
+anova_tukey_fractionation("Intron 6")
+anova_tukey_fractionation("Intron 7")
+
+ggsave("figures/Autoregulation/rt_pcr_fractionation_psi.pdf", plot = fract_scatterplot, width = 5, height = 3)
+
+```
+

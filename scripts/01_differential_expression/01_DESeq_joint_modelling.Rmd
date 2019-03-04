@@ -1,0 +1,1087 @@
+---
+title: "Joint differential expression modelling"
+author: "Jack Humphrey"
+date: "31/08/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "~/google_drive/Work/PhD_Year_4/FUS_meta-analysis/")
+library(readr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(dplyr)
+library(plotly)
+library(patchwork)
+library(pheatmap)
+library(DESeq2)
+library(gProfileR)
+library(ggrepel)
+library(ggbeeswarm)
+library(VennDiagram)
+library(ggplotify)
+library(ggrastr) # for rasterising scatterplots with 40,000 points so as not to crash inkscape
+```
+
+```{r}
+support <-readr::read_tsv("data/DESeq2/joint/fixed_covariate/DESEq_joint_support_new_covariate.tab")
+
+biomart <- read_tsv("misc/biomart_annotations_mouse.txt")
+
+signed_z <- function(log2fc, pvalue){
+  z <- ifelse(test = log2fc > 0,
+	  					yes = qnorm(1 - (pvalue / 2)),
+	  					no = qnorm(pvalue / 2) )
+  return(z)
+}
+
+makeGProfile <- function(genes, filter = "none"){
+  gprofiler( query =  genes,
+                       organism = "mmusculus",
+                       src_filter = c("GO", "KEGG", "REAC", "CORUM"),
+             hier_filtering = filter 
+                       )
+}
+
+# count matrix 
+load("data/DESeq2/joint/fixed_covariate/joint_DESEq_condition_all_deseq.Rdata")
+# create metadata table from mcols
+meta <- as.data.frame(mcols(dds))
+meta$EnsemblID <- names(mcols(dds)@listData$maxCooks)
+meta <- left_join(meta, biomart, by = "EnsemblID")
+
+
+counts <- counts(dds)
+size_factors <- sizeFactors(dds)
+
+```
+
+
+# DESeq2 joint modelling using Wald test instead of Likelihood Ratio Test
+
+
+```{r}
+# with dataset covariate split
+wald_file_split_cov <- "data/DESeq2/joint/joint_DESEq_condition_all_deseq_Wald_full_dataset_covariate.Rdata"
+
+loadWald <- function(waldfile){
+  load(waldfile)
+  ko <- left_join(fus_ko, biomart, by = "EnsemblID") %>%
+    arrange(padj) %>%
+    as_tibble()
+  mut <- left_join(fus_mut, biomart, by = "EnsemblID") %>%
+    arrange(padj) %>%
+    as_tibble()
+  
+  wald <- list(ko = ko, mut = mut, dds = dds)
+  return(wald)
+}
+
+
+wald <- loadWald(wald_file_split_cov)
+
+```
+
+Using the Wald test with DESeq allows me to use all the samples together (maximising power) but get out a p-value for each comparison. The Wald test compares the estimated fold change to 0. 
+How many genes are significant in the two comparisons? How many overlap?
+
+```{r}
+
+table(wald_ko = wald$ko$padj < 0.05)
+table(wald_mut = wald$mut$padj < 0.05)
+
+wald_mut_sig <- filter(wald$mut, padj < 0.05)
+wald_ko_sig <- filter(wald$ko, padj < 0.05)
+
+n_wald_mut_sig <- nrow(wald_mut_sig)
+n_wald_ko_sig <- nrow(wald_ko_sig)
+
+
+length(intersect(wald_mut_sig$EnsemblID, wald_ko_sig$EnsemblID))
+
+
+
+
+```
+
+# Z score plots to compare overlap
+
+```{r}
+
+wald_ko <- dplyr::select(wald$ko, EnsemblID, p_ko = pvalue, lfc_ko = log2FoldChange, padj_ko = padj)
+wald_mut <- dplyr::select(wald$mut, EnsemblID, p_mut = pvalue, lfc_mut = log2FoldChange, padj_mut = padj)
+
+combined <- full_join(wald_ko, wald_mut)
+
+combined$z_ko <- signed_z(combined$lfc_ko, combined$p_ko)
+combined$z_mut <- signed_z(combined$lfc_mut, combined$p_mut)
+
+combined <- mutate( combined,
+ status_strict = case_when( 
+  padj_ko < 0.05 & padj_mut < 0.05 ~ "Overlapping",
+  padj_ko < 0.05 & (padj_mut > 0.05 | is.na(padj_mut) ) ~ "Knockout specific",
+  padj_ko > 0.05 & (padj_mut < 0.05 | is.na(padj_ko) ) ~ "Mutation specific",
+  TRUE ~ "None") 
+ )
+
+combined <- mutate( combined,
+ status_relaxed = case_when( 
+   padj_ko < 0.05 & p_mut < 0.05 | padj_mut < 0.05 & p_ko < 0.05 ~ "Overlapping",
+   padj_ko < 0.05 & p_mut >= 0.05 ~ "Knockout specific",
+   p_ko >= 0.05 & padj_mut < 0.05 ~ "Mutation specific",
+   TRUE ~ "None")
+)
+
+combined <- left_join(combined, biomart)
+save( combined, file = "results/02_DESeq/combined_wald_DESeq_data.Rdata" )
+
+# for printing into appendices/ supplementaries
+combined_print <-
+  combined %>%
+  dplyr::select(EnsemblID, p_ko, lfc_ko, padj_ko, p_mut, lfc_mut, padj_mut, gene_name,status_strict, status_relaxed)
+
+
+cols <- c("None" = "darkgray", 
+          "Mutation specific" = "dodgerblue3", "Knockout specific" = "firebrick2", "Overlapping" = "purple")
+
+overlap_zscore_plot <-
+  ggplot( combined, aes( x = z_ko, y = z_mut, colour = status_strict)) + 
+  geom_point(size = 0.5) + xlim(-10,10) + ylim(-10,10) +
+  geom_abline(slope = 1, intercept =0)  +
+  labs(title = "strict overlap", subtitle = "q < 0.05 in  both") +
+  theme_bw() +
+  theme(panel.grid = element_blank()) +
+  xlab("Z-score KO") + ylab("Z-score MUT") +
+  scale_colour_manual(values = cols) + 
+  ggplot( combined, aes( x = z_ko, y = z_mut, colour = status_relaxed)) + 
+  geom_point(size = 0.5) + xlim(-10,10) + ylim(-10,10) +
+  geom_abline(slope = 1, intercept =0)  +
+  labs(title = "relaxed overlap",  subtitle ="q < 0.05 in one, p < 0.05 in the other") +
+  plot_layout(ncol = 2) +
+  xlab("Z-score KO") + ylab("Z-score MUT") +
+  theme_bw() +
+  theme(panel.grid = element_blank()) +
+  scale_colour_manual(values = cols)  
+
+ggsave(overlap_zscore_plot, filename = "figures/Gene_Expression/overlap_type_z_score_plot.pdf",height = 6, width = 12 )
+
+
+# put in appendices/supplementaries
+overlap_zscore_plot
+
+```
+
+```{r}
+table(combined$status_strict)
+
+table(combined$status_relaxed)
+
+n_overlap_strict <- nrow(filter(combined, status_strict == "Overlapping"))
+n_overlap_relaxed <- nrow(filter(combined, status_relaxed == "Overlapping"))
+
+venn_strict <- 
+  as.ggplot(
+    ~draw.pairwise.venn(
+      area1 = n_wald_ko_sig, 
+      area2 = n_wald_mut_sig, 
+      cross.area = n_overlap_strict, 
+      #category = c("knockouts", "mutants"), 
+      fill = c("red","blue"),
+      alpha = 0.5,
+      cat.cex = c(1,1),
+      cat.fontfamily = "sans", 
+      cat.pos = 360,
+      cat.dist = c(0.1,0.1))
+      ) +
+  labs(title = "i) overlap = q < 0.05 in both") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+venn_relaxed <- 
+  as.ggplot(
+    ~draw.pairwise.venn(
+      area1 = nrow( filter(combined, status_relaxed %in% c("Knockout specific", "Overlapping" ) ) ) , 
+      area2 = nrow( filter(combined, status_relaxed  %in% c("Mutation specific", "Overlapping" ))) , 
+      cross.area = n_overlap_relaxed, 
+      #category = c("knockouts", "mutants"), 
+      fill = c("red","blue"),
+      alpha = 0.5,
+      cat.cex = c(1,1),
+      cat.fontfamily = "sans", 
+      cat.pos = 360,
+      cat.dist = c(0.1,0.1))
+      ) +
+  labs(title = "ii) overlap = q < 0.05 in one and P < 0.05 in the other") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+venn_multi <- 
+  venn_strict + venn_relaxed + plot_layout(nrow = 2) + plot_annotation(caption = "red: knockouts, blue: mutants")
+
+ggsave(plot = venn_multi, filename = "figures/Gene_Expression/venn_overlaps.pdf", width = 7, height = 4)
+
+venn_multi
+
+
+```
+
+Wald DESeq2 run on each individual dataset. Use these for the gene plots
+
+```{r}
+
+individuals_wald <- list.files("data/DESeq2/individual_wald/", pattern = ".tab", full.names = TRUE )
+
+individuals_wald <- individuals_wald[ !grepl("HET", individuals_wald)]
+
+indiv_w <- map(individuals_wald, ~{
+  d <- read.table(.x, header=TRUE, fill = TRUE)
+  d <- arrange(d, padj)
+  d
+})
+  
+names(indiv_w) <- c("Bozzoni\nKO", "Bozzoni\nMUT", "Dupuis\nKO", "Dupuis\nMUT", "Fratta\nKO", "Fratta\nMUT")
+
+combine_individuals <-
+  map2( indiv_w, names(indiv_w), ~{
+    d <- .x %>%
+    dplyr::select(EnsemblID, log2FoldChange, pvalue) 
+    names(d)[2:3] <- paste(.y, names(d)[2:3])
+    d
+ }) %>%
+  purrr::reduce( left_join, by = "EnsemblID") %>%
+  as_tibble()
+
+
+
+```
+
+
+
+Similar story to the combined analysis above. What does the direction comparison look like?
+
+```{r}
+
+#support_full <- read_tsv("data/DESeq2/joint/DESEq_joint_support.tab")
+#support_full <- dplyr::select(support_full, sample = sample_name, condition_all = condition, everything())
+
+#-------------- normalised counts per gene -------------
+
+# get individual LFCs and q-values
+
+countPlot <- function(gene, normalised = FALSE, metadata = FALSE){
+  dataset_order <- c("Bozzoni\nMUT", "Dupuis\nMUT","Fratta\nMUT", "Bozzoni\nKO", "Dupuis\nKO", "Fratta\nKO")
+  
+  ID <- filter(biomart, gene_name == gene)$EnsemblID  
+  # in case of 2 IDs find out which is in counts
+  ID_in_counts <- ID %in% row.names(counts)
+  
+  gene_counts <- counts[ ID[ID_in_counts], ] / size_factors
+  
+  if(!is.null(nrow(gene_counts) ) ){
+    gene_counts <- head(gene_counts,1)
+  }
+ #  
+ #  # get metadata from individual analyses
+ #  individual_meta <- 
+ #    combine_individuals %>%
+ #    filter(EnsemblID == ID) %>%
+ #    gather(key = "dataset_coefficient", value = "value", -EnsemblID) %>%
+ #    tidyr::separate(col = dataset_coefficient, into = c("dataset", "coefficient"), sep = " ") %>%
+ #    mutate( value = signif(value, digits = 2)) %>%
+ #    tidyr::spread( key = coefficient, value = value) %>%
+ #    mutate(text_string = paste0(log2FoldChange," P=", pvalue))
+ #  
+ #  # get text string as a named vector
+ #  individual_meta_string <- individual_meta$text_string
+ #  names(individual_meta_string) <- individual_meta$dataset
+ #  
+ #  individual_meta_string <- individual_meta_string[dataset_order]
+ #  individual_meta_string <- paste( dataset_order, individual_meta_string, sep = "\n")
+ #  
+ #  # get metadata from joint analyses
+ # joint_meta <- 
+ #    combined %>%
+ #    filter(EnsemblID == ID) %>%
+ #    dplyr::select(EnsemblID, p_ko, lfc_ko, p_mut, lfc_mut) %>%
+ #    tidyr::gather(key = "coefficient_dataset", value = "value", -EnsemblID) %>%
+ #    mutate( value = signif(value, digits = 2)) %>% 
+ #    tidyr::separate(col = coefficient_dataset, into = c("coefficient", "dataset"), sep = "_") %>%
+ #    tidyr::spread( key = coefficient, value = value) %>%
+ #    mutate(dataset = str_to_upper(dataset)) %>%
+ #    rename(lfc = "log2FoldChange", p = "pvalue") %>%
+ #    mutate(text_string = paste0(dataset," ", log2FoldChange," P=", pvalue))
+ # 
+ # joint_meta_string <- paste0( joint_meta$text_string[2], "  ", joint_meta$text_string[1])
+ # 
+  cols <- 
+    c("CTL" = "darkgray", 
+      "MUT" = "dodgerblue3", "MUT\nHET" = "dodgerblue", "MUT\nHOM" = "dodgerblue3", 
+      "KO" = "firebrick2", "KO\nHET" = "firebrick1", "KO\nHOM" = "firebrick2" )
+
+  
+  counts_table <-
+    gene_counts %>%
+    tibble( sample = names(.), counts = .) %>%
+    left_join( support, by = "sample") %>%
+    mutate(condition_all = gsub("FUS_", "", condition_all)) %>%
+    mutate(dataset = gsub("Nicol", "Fratta", dataset)) 
+  
+  # split controls - Dupuis and Fratta are not shared
+  
+  
+  counts_table <-
+    counts_table %>%
+    mutate(dataset_separate = str_split(sample,pattern = "-", n = 2, simplify = TRUE )[,1] ) %>%
+    mutate(dataset_separate = case_when( 
+      dataset_separate == "Dupuis_KO" ~ "Dupuis\nKO",
+      dataset_separate == "Dupuis_NLS" ~ "Dupuis\nMUT",
+      dataset_separate == "Bozzoni" ~ "Bozzoni",
+      dataset_separate == "Nicol_d14" ~ "Fratta\nMUT",
+      dataset_separate == "Nicol_KO" ~ "Fratta\nKO") ) 
+  counts_table_split <- split(counts_table, counts_table$dataset_separate)
+  
+  # split Bozzoni into KO and MUT and double up controls
+  counts_table_split$Bozzoni_KO <- 
+    counts_table_split$Bozzoni %>%
+    filter(condition_all != "MUT") %>%
+    mutate(dataset_separate = "Bozzoni\nKO")
+  
+  counts_table_split$Bozzoni_MUT <- 
+    counts_table_split$Bozzoni %>%
+    filter(condition_all != "KO") %>%
+    mutate(dataset_separate = "Bozzoni\nMUT")
+  
+  counts_table_split$Bozzoni <- NULL
+  # put back together
+  counts_table <- 
+    map_df( counts_table_split, ~{.x})
+  
+  # if metadata wanted then add as labels
+  if( metadata == FALSE){
+    counts_table <-
+      mutate( counts_table,
+              dataset_separate = factor( 
+        dataset_separate,
+        levels = dataset_order))
+  }
+  else{
+    counts_table <-
+    mutate( counts_table,
+      dataset_separate = factor( 
+        dataset_separate,
+        levels = dataset_order,
+        labels = individual_meta_string))
+  }
+  
+  
+  # get means per dataset_separate
+  means <-
+    counts_table %>%
+    group_by(dataset_separate, condition_all) %>%
+    summarise( condition_mean = mean(counts))
+  
+  # normalise by mean in control for that dataset
+  control_means <- 
+    filter(means, condition_all == "CTL") %>%
+    dplyr::select( dataset_separate, control_mean = condition_mean)
+  
+
+  counts_table <-
+    counts_table %>%
+    left_join( control_means, by = "dataset_separate") %>%
+    mutate( normalised = counts / control_mean) %>%
+    left_join( means, by = c("dataset_separate", "condition_all"))
+  
+  
+  # if normalisation requested then plot normalised values and normalise means 
+  if( normalised == FALSE){
+    plot <- 
+      counts_table %>%
+      ggplot( aes( y = counts, label = sample, x = condition_all, colour = condition_all))
+  }
+   if( normalised == TRUE){
+    counts_table <-
+      mutate(counts_table, condition_mean = condition_mean / control_mean)
+    
+     plot <- counts_table %>%
+      ggplot( aes( y = normalised, label = sample, x = condition_all, colour = condition_all)) #+
+      #scale_y_continuous(labels = scales::percent)
+   }
+  # add means to table
+
+  plot <- 
+    plot +
+    facet_grid(. ~dataset_separate, scale = "free_x", space = "free_x" ) +
+    #geom_jitter(width = 0.2) +
+    geom_beeswarm(cex=10) +
+    scale_colour_manual(values = cols) +
+    theme_bw() +
+    ylab("") +
+    xlab("") +
+    guides(colour = FALSE) +
+    theme(panel.grid = element_blank(),
+          axis.title.y=element_blank(),
+          panel.spacing.x = unit(0, "lines"),
+          panel.border = element_rect(colour = "darkgrey"),
+          #axis.line = element_line(colour = "black"),
+          #axis.text.y=element_blank(),
+          #axis.ticks.y=element_blank(),
+          plot.title = element_text(face = "italic",hjust = 0.5),
+          plot.subtitle = element_text(hjust = 0.5),
+          strip.background = element_blank()
+    ) +
+    geom_errorbar( aes(x = condition_all, ymin = condition_mean, ymax = condition_mean ), width = 0.5, colour = "black" )
+  
+  
+  if(metadata == FALSE){
+    plot <- plot + labs(title = gene) 
+  }else{
+    plot <- plot + labs(title = gene, subtitle = joint_meta_string)
+  }
+  return(plot)
+}
+
+countPlot("Fus", normalised = TRUE)
+
+complex_figure <- 
+(  countPlot(gene = "Fus") |
+  countPlot(gene = "Taf15") |
+  countPlot(gene = "Trove2") ) #/
+# ( countPlot(gene = "Xlr3a") |
+#   countPlot(gene = "Xlr3b") |
+#   countPlot(gene = "Xlr4b") )
+
+complex_figure_normalised <- 
+ countPlot(gene = "Fus", normalised = TRUE) +
+  countPlot(gene = "Taf15", normalised = TRUE) +
+  countPlot(gene = "Trove2", normalised = TRUE) +
+  plot_layout( nrow = 3)
+
+# /
+# ( countPlot(gene = "Xlr3a", normalised = TRUE) |
+#   countPlot(gene = "Xlr3b", normalised = TRUE) |
+#   countPlot(gene = "Xlr4b", normalised = TRUE) )
+
+ggsave(plot = complex_figure, filename = "figures/Gene_Expression/compare_gene_expression_multipanel.pdf", width = 12, height = 4)
+
+ggsave(plot = complex_figure_normalised, filename = "figures/Gene_Expression/compare_gene_expression_multipanel_normalised.pdf", width = 5, height = 8)
+
+
+```
+
+
+```{r}
+#----------- scatter of fold changes 
+
+to_plot <- 
+  filter(combined, status_relaxed != "None" ) %>%
+  left_join(biomart)# %>%
+  #mutate( status = factor(status, levels = c("Knockout specific", "Overlapping", "Mutation specific")))
+
+key_genes <- 
+  filter(to_plot, gene_name %in% c("Fus", "Taf15", "Trove2","Sbk3", "Ewsr1") | grepl("Xlr", gene_name) )
+
+main_plot_cols <- c("Overlapping" = "purple", 
+                    "Mutation specific" = "dodgerblue",
+                    "Knockout specific" = "firebrick2",
+                    "None" = "darkgrey")
+
+# main_plot <-
+# ggplot(to_plot, aes( x = lfc_ko, y = lfc_mut)) + 
+#   geom_point(aes(colour = status_strict), alpha = 0.5, size = 0.75) +
+#   theme_bw() +
+#   xlab( expression( log[2]~fold~change~knockouts)  ) +
+#   ylab(  expression( log[2]~fold~change~knockouts) ) +
+#   scale_colour_manual(values = main_plot_cols) +
+#   geom_smooth(data = filter(to_plot, status_strict == "Overlapping"),
+#               aes(x = lfc_ko, y = lfc_mut), method = "lm") +
+#   geom_abline(slope = 1, intercept = 0, linetype = 3) +
+#   geom_point( data = key_genes, aes( x = lfc_ko, y =lfc_mut), colour = "black") +
+#   geom_text_repel(data = key_genes,
+#                                 aes( x = lfc_ko, y = lfc_mut, label = gene_name),force = 1000, fontface = "italic") + 
+#   facet_wrap(~status_strict) +
+#   guides(colour = FALSE) +
+#   theme(strip.background = element_rect(colour="black", fill="white") )
+
+main_plot_strict <-
+  filter(to_plot, status_strict == "Overlapping") %>%
+  ggplot(aes( x = lfc_ko, y = lfc_mut)) + 
+  geom_point(aes(colour = status_strict), alpha = 0.5, size = 0.75) +
+  theme_classic() +
+  xlab( expression( log[2]~fold~change~FUS~KO)  ) +
+  ylab( expression( log[2]~fold~change~FUS~MUT) ) +
+  scale_colour_manual(values = main_plot_cols) +
+  geom_smooth(aes(x = lfc_ko, y = lfc_mut), method = "lm", colour = "black", fill = "black") +
+  geom_abline(slope = 1, intercept = 0, linetype = 3) +
+  geom_point( data = key_genes, aes( x = lfc_ko, y =lfc_mut, colour = status_relaxed)) +
+  geom_text_repel(data = key_genes,
+                                aes( x = lfc_ko, y = lfc_mut, label = gene_name),force = 25, fontface = "italic") + 
+  #facet_wrap(~status_relaxed) +
+  guides(colour = FALSE) +
+  scale_y_continuous( breaks = c(-1,0,1), limits = c(-1.5,1.5)) +
+  theme(strip.background = element_rect(colour="black", fill="white"),
+        panel.grid = element_blank()
+        ) +
+  geom_hline(yintercept = 0, linetype = 3, colour = "darkgrey") +
+  geom_vline(xintercept = 0, linetype = 3, colour = "darkgrey") +
+  xlim(-1.5,1.5) + labs(caption = expression(beta*"=0.8; P=1e-16"))
+
+main_plot_strict
+
+ggsave(plot = main_plot_strict, filename = "figures/Gene_Expression/overlapping_strict_fold_change_scatter.pdf", width = 6, height = 5 )
+
+
+# plot 1308 relaxed overlap genes by log2FC
+
+main_plot_relaxed <-
+  filter(to_plot, status_relaxed == "Overlapping") %>%
+  ggplot(aes( x = lfc_ko, y = lfc_mut)) + 
+  geom_point(aes(colour = status_relaxed), alpha = 0.5, size = 0.75) +
+  theme_classic() +
+  xlab( expression( log[2]~fold~change~FUS~KO)  ) +
+  ylab( expression( log[2]~fold~change~FUS~MUT) ) +
+  scale_colour_manual(values = main_plot_cols) +
+  geom_smooth(aes(x = lfc_ko, y = lfc_mut), method = "lm", colour = "black", fill = "black") +
+  geom_abline(slope = 1, intercept = 0, linetype = 3) +
+  geom_point( data = key_genes, aes( x = lfc_ko, y =lfc_mut, colour = status_relaxed)) +
+  geom_text_repel(data = key_genes,
+                                aes( x = lfc_ko, y = lfc_mut, label = gene_name),force = 25, fontface = "italic") + 
+  #facet_wrap(~status_relaxed) +
+  guides(colour = FALSE) +
+  scale_y_continuous( breaks = c(-1,0,1), limits = c(-1.5,1.5)) +
+  theme(strip.background = element_rect(colour="black", fill="white"),
+        panel.grid = element_blank()
+        ) +
+  geom_hline(yintercept = 0, linetype = 3, colour = "darkgrey") +
+  geom_vline(xintercept = 0, linetype = 3, colour = "darkgrey") +
+  xlim(-1.5,1.5) + labs(caption = expression(beta*"=0.76; P=1e-16"))
+
+main_plot_relaxed
+
+ggsave(plot = main_plot_relaxed, filename = "figures/Gene_Expression/overlapping_relaxed_fold_change_scatter.pdf", width = 6, height = 5 )
+
+# fit linear models
+overlapping_strict <- filter(combined, status_strict == "Overlapping")
+overlapping_relaxed <- filter(combined, status_relaxed == "Overlapping")
+
+mod <- lm( lfc_mut ~ lfc_ko, data = overlapping_strict)
+broom::tidy(mod)
+
+summary(mod)
+
+mod <- lm( lfc_mut ~ lfc_ko, data = overlapping_relaxed)
+broom::tidy(mod)
+mut_sig <- nrow(filter(wald$mut, padj < 0.05))
+ko_sig <- nrow(filter(wald$ko, padj < 0.05))
+overlap <- length(intersect(wald_mut_sig$EnsemblID, wald_ko_sig$EnsemblID))
+
+cor(overlapping_relaxed$lfc_ko, overlapping_relaxed$lfc_mut, method = "spearman")
+
+opposing <- filter(overlapping_relaxed, sign(lfc_mut) != sign(lfc_ko))
+```
+
+Comparing the fitted log2 fold changes in the KO and MUT joint models for the 1318 genes that overlap
+Only 7 genes are changed in the opposite direction (0.5%). 3/7 have FUS iCLIP peaks overlapping
+Prickle2 is a synaptic gene, large number of iCLIP peaks in first 250kb intron - long gene!
+Dcaf7 has a 7 read iCLIP peak in the first intron (short intron)
+Cds2 has 2 peaks (7 and 1) in the 3'UTR
+
+Known FUS interactors Taf15 and Ewsr1 are upregulated in both MUT and KO.
+Sbk3 is strongly downregulated in both conditions.
+Xlr3a, 3b, 4a and 4b are all upregulated, more so in KO than MUT.
+Trove2 is downregulated in MUT only and unchanged in KO. 
+Fus itself is downregulated in FUS KO and unchanged in MUT.
+Comparing the log2 fold changes (LFC) between KO and MUT with linear regression demonstrates that the overlapping genes are changed on average 76% in MUT of the strength in KO. ( lfc_MUT = 0.76 . 
+lfc_KO - 0.0017; P < 1e-16; F-test).
+
+For supplementaries, plot scatter with all genes
+
+```{r}
+
+supp_genes <- filter(key_genes, gene_name %in% c("Fus", "Trove2", "Taf15", "Xlr3a","Xlr3b"))
+
+supp_plot_relaxed <-
+  filter(to_plot, status_relaxed != "None") %>%
+  ggplot(aes( x = lfc_ko, y = lfc_mut)) + 
+  geom_point(aes(colour = status_relaxed), alpha = 0.5, size = 0.75) +
+  theme_classic() +
+  xlab( expression( log[2]~fold~change~FUS~KO)  ) +
+  ylab( expression( log[2]~fold~change~FUS~MUT) ) +
+  scale_colour_manual(values = main_plot_cols) +
+  #geom_smooth(aes(x = lfc_ko, y = lfc_mut, colour = status_relaxed), method = "lm", fill = "black") +
+  geom_abline(slope = 1, intercept = 0, linetype = 3) +
+  geom_point( data = supp_genes, aes( x = lfc_ko, y =lfc_mut, colour = status_relaxed)) +
+  geom_text_repel(data = supp_genes,
+                                aes( x = lfc_ko, y = lfc_mut, label = gene_name),force = 1000, fontface = "italic") + 
+  #facet_wrap(~status_relaxed) +
+  #guides(colour = FALSE) +
+  scale_y_continuous( breaks = c(-1,0,1), limits = c(-1.5,1.5)) +
+  theme(strip.background = element_rect(colour="black", fill="white"),
+        panel.grid = element_blank()
+        ) +
+  geom_hline(yintercept = 0, linetype = 3, colour = "darkgrey") +
+  geom_vline(xintercept = 0, linetype = 3, colour = "darkgrey") +
+  xlim(-1.5,1.5) 
+#+ labs(caption = expression(beta*"=0.76; P=1e-16"))
+
+supp_plot_relaxed
+
+ggsave(plot = supp_plot_relaxed, filename = "figures/Gene_Expression/all_categories_relaxed_fold_change_scatter.pdf", width = 6, height = 5 )
+
+
+```
+
+
+
+
+```{r}
+#----------------- Venn Diagram ----------------
+
+venn_plot <- 
+  as.ggplot(
+    ~draw.pairwise.venn(
+      area1 = ko_sig, 
+      area2 = mut_sig, 
+      cross.area = overlap, 
+      category = c("knockouts", "mutants"), 
+      fill = c("red","blue"),
+      alpha = 0.5,
+      cat.cex = c(1,1),
+      cat.fontfamily = "sans", 
+      cat.pos = 360,
+      cat.dist = c(0.1,0.1))
+      ) +
+  labs(title = "Differentially expressed genes at FDR 5%") +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+library(patchwork)
+
+# p1 <- { 
+#   venn_plot +
+#   main_plot +
+#   plot_layout(ncol = 2, widths = c(2,4))
+#   } 
+
+# complex_figure <- 
+# (  countPlot(gene = "Fus") |
+#   countPlot(gene = "Taf15") |
+#   countPlot(gene = "Trove2") ) /
+# ( countPlot(gene = "Xlr3a") |
+#   countPlot(gene = "Xlr3b") |
+#   countPlot(gene = "Xlr4b") )
+
+complex_figure_normalised <- 
+(  countPlot(gene = "Fus", normalised = TRUE) |
+  countPlot(gene = "Taf15", normalised = TRUE) |
+  countPlot(gene = "Trove2", normalised = TRUE) ) 
+# ( countPlot(gene = "Xlr3a", normalised = TRUE) |
+#   countPlot(gene = "Xlr3b", normalised = TRUE) |
+#   countPlot(gene = "Xlr4b", normalised = TRUE) )
+
+#ggsave(plot = complex_figure, filename = "figures/Gene_Expression/compare_gene_expression_multipanel.pdf", width = 12, height = 6)
+ggsave(plot = complex_figure_normalised, filename = "figures/Gene_Expression/compare_gene_expression_multipanel_normalised.pdf", width = 12, height = 6)
+
+complex_figure
+
+```
+
+Output tables
+
+```{r}
+expression_table <-
+  combined %>%
+  dplyr::select(EnsemblID, gene_name, lfc_ko, p_ko, padj_ko, lfc_mut, p_mut, padj_mut, status_strict, status_relaxed ) 
+names(expression_table) <- c("EnsemblID",
+                             "Gene",
+                             "log2FC_KO", 
+                             "P_KO", 
+                             "FDR_KO",
+                             "log2FC_MUT", 
+                             "P_MUT",
+                             "FDR_MUT",
+                             "Overlap_strict",
+                             "Overlap_relaxed"
+                             
+)
+
+write_csv(expression_table, path = "results/tables/joint_model_expression.csv")
+
+```
+
+
+
+Gene ontology bar plots
+
+```{r}
+# profiles_strict <- 
+#   filter(combined, !is.na(status_strict)) %>%
+#   left_join(biomart) %>%
+#   mutate(direction = ifelse(lfc_ko > 0, "up", "down")) %>%
+#   split( paste0( .$status_strict,"_",.$direction ) ) %>% 
+#   map( "gene_name") %>%
+#   map_df( makeGProfile, filter = "none", .id = "comparison" )
+
+profiles_relaxed <- 
+  filter(combined, (status_relaxed != "None")) %>%
+  left_join(biomart) %>%
+  mutate(direction = ifelse(lfc_ko > 0, "up", "down")) %>%
+  split( paste0( .$status_relaxed,"_",.$direction ) ) %>% 
+  map( "gene_name") %>%
+  map_df( makeGProfile, filter = "none", .id = "comparison" )
+
+# write out for supplementaries
+
+write_tsv(profiles_relaxed, "results/tables/expression_GO_full.tsv")
+
+
+# relaxed overlap GO terms plot -----------------------------
+
+all_profiles_plot <-
+  filter(profiles_relaxed, overlap.size >= 5) %>%
+  arrange( -log10(p.value) ) %>%
+  mutate( term.name = as.factor(term.name)) %>%
+  ggplot( aes( x = term.name, y = -log10(p.value), fill = comparison )) + geom_col() + facet_wrap(~comparison, scale = "free_y", nrow = 2) +
+  coord_flip() + 
+  theme_bw() +
+  guides(fill=FALSE)
+
+# as table
+# all_profiles %>%
+#   filter(overlap.size >= 10) %>%
+#   select( term.name, overlap.size, p.value, comparison) %>%
+#   arrange( comparison )
+
+# curate terms to reduce size of plots
+curated_terms <- c(
+  "synaptic signalling",
+  "neuron part",
+  "ion transport",
+  "intrinsic component of membrane",
+  "chemical synaptic transmission",
+  "gene expression",
+  "ribosome biogenesis",
+ "ribonucleoprotein complex biogenesis",
+  "RNA processing",
+  "RNA splicing",
+ "Dopaminergic synapse",
+ "nucleic acid-templated transcription",
+ "chemical synaptic transmission",
+ "neuron part",
+  #"cytoplasm",
+  #"nucleus",
+ "spliceosome",
+  "axon",
+  "RNA binding",
+  "neuron part",
+  "regulation of signalling",
+  "protein transport",
+  "RNA metabolic process",
+  "synaptic signaling",
+  "Neuroactive ligand-receptor interaction",
+ "ion binding",
+ "ATP binding",
+ "extracellular matrix structural constituent",
+ "Osteoclast differentiation"
+)
+
+curated_profiles_relaxed <- 
+  function( group_name = "Overlapping", fill_colour = "Purple"){
+    profiles_relaxed %>%
+      filter(term.name %in% curated_terms) %>%
+      separate(col = comparison,into = c("group", "direction"),sep ="_", remove = FALSE ) %>%
+      filter( group == group_name ) %>%
+      arrange( -log10(p.value) ) %>%
+      mutate( term.name = factor(term.name, levels = term.name)) %>%
+      ggplot( aes( x = term.name, y = -log10(p.value) ) ) + 
+      geom_col(fill = fill_colour) + 
+      facet_grid(direction ~ ., space = "free", scales = "free") +
+      coord_flip() + 
+      theme_classic() +
+      guides(fill=FALSE) +
+      ylab(label = expression(log[10]~(P~value)) ) +
+      xlab("") +
+      theme(strip.background = element_blank()) +
+      theme(strip.text.y = element_text(face = "bold",angle = 0)) +
+      labs(title = unique(group_name) ) +
+      scale_y_continuous(expand = c(0, 0))
+}
+
+# broken?!
+# multipanel_go <-
+#   curated_profiles_relaxed(group = "Knockout specific", fill_colour = "firebrick2") +
+#   curated_profiles_relaxed(group = "Overlapping", fill_colour = "purple") + 
+#   curated_profiles_relaxed(group = "Mutation specific", fill_colour = "dodgerblue")
+# 
+# ggsave(plot = multipanel_go, filename = "figures/Gene_Expression/curated_GO_terms_relaxed.pdf", width = 12, height = 5)
+
+
+# strict version -------------------------
+
+all_profiles_plot <-
+  filter(profiles_strict, overlap.size >= 10) %>%
+  arrange( -log10(p.value) ) %>%
+  mutate( term.name = as.factor(term.name)) %>%
+  ggplot( aes( x = term.name, y = -log10(p.value), fill = comparison )) + geom_col() + facet_wrap(~comparison, scale = "free_y", nrow = 2) +
+  coord_flip() + 
+  theme_bw() +
+  guides(fill=FALSE)
+
+
+curated_profiles_strict <- function( group_name = "Overlapping", fill_colour = "Purple"){
+  profiles_strict %>%
+  filter(term.name %in% curated_terms) %>%
+  separate(col = comparison,into = c("group", "direction"),sep ="_", remove = FALSE ) %>%
+  filter( group == group_name ) %>%
+      arrange( -log10(p.value) ) %>%
+  mutate( term.name = as.factor(term.name)) %>%
+  ggplot( aes( x = term.name, y = -log10(p.value) ) ) + 
+    geom_col(fill = fill_colour) + 
+    facet_grid(direction ~ ., space = "free", scales = "free") +
+  coord_flip() + 
+  theme_classic() +
+  guides(fill=FALSE) +
+  ylab(label = expression(log[10]~(P~value)) ) +
+  xlab("") +
+  theme(strip.background = element_blank()) +
+  theme(strip.text.y = element_text(face = "bold",angle = 0)) +
+  labs(title = unique(group_name) ) +
+  scale_y_continuous(expand = c(0, 0))
+
+}
+
+multipanel_go <-
+  curated_profiles_strict(group = "Knockout specific", fill_colour = "firebrick2") +
+  curated_profiles_strict(group = "Overlapping", fill_colour = "purple") + 
+  curated_profiles_strict(group = "Mutation specific", fill_colour = "dodgerblue")
+
+ggsave(plot = multipanel_go, filename = "figures/Gene_Expression/curated_GO_terms_strict.pdf", width = 12, height = 5)
+
+
+## SAVE GO OUTPUTS
+
+
+```
+
+Heatmaps
+
+```{r}
+library(pheatmap)
+
+table(combined$status_relaxed)
+# get 3 sets of genes
+gene_sets <- split(combined, combined$status_relaxed) %>%
+  map( ~{
+    arrange(.x, padj_ko)$EnsemblID
+  })
+
+
+test <- filter(wald$mut, padj < 0.05, abs(log2FoldChange) > 0.5) %>% arrange( log2FoldChange) %>% pull(EnsemblID)
+test_counts <- counts * size_factors
+# pull out counts of each set
+overlapping <- test_counts[ test, grepl("Nicol", colnames(test_counts))]
+
+#test <- as.matrix(overlapping[1:100,])
+
+pheatmap(overlapping,scale = "row", cluster_rows = FALSE, cluster_cols = TRUE,show_rownames = FALSE)
+
+
+
+```
+
+
+Comparing individual results with joint model
+How many genes are found to be changed in individual datasets but are not present in joint model?
+
+```{r}
+# individuals <- list.files("data/DESeq2/", pattern = "differential_expression.tab", full.names = TRUE)
+# 
+# individuals <- individuals[ !grepl("HET", individuals)]
+# 
+# indiv <- map(individuals, read.table, header=TRUE, fill = TRUE)
+# names(indiv) <- c("Bozzoni_KO", "Bozzoni_MUT", "Dupuis_KO", "Dupuis_MUT", "Fratta_KO", "Fratta_MUT")
+# indiv %>% map( filter, padj < 0.05) %>% map(nrow)
+# indiv_genes <- map(indiv, filter, padj < 0.05) %>% map("EnsemblID")
+# 
+# 
+
+joint_ko_genes <- combined %>% filter(padj_ko < 0.05) %>% pull("EnsemblID")
+joint_mut_genes <- combined  %>% filter(padj_mut < 0.05) %>% pull("EnsemblID")
+
+joint_ko <- length(joint_ko_genes)
+joint_mut <- length(joint_mut_genes)
+
+# get results of running DESeq (keeping sex chromosomes, running Wald test rather than LRT)
+
+individuals_wald <- list.files("data/DESeq2/individual_wald/", pattern = ".tab", full.names = TRUE )
+
+individuals_wald <- individuals_wald[ !grepl("HET", individuals_wald)]
+
+indiv_w <- map(individuals_wald, ~{
+  d <- read.table(.x, header=TRUE, fill = TRUE)
+  d <- arrange(d, padj)
+  d
+})
+  
+names(indiv_w) <- c("Bozzoni_KO", "Bozzoni_MUT", "Dupuis_KO", "Dupuis_MUT", "Fratta_KO", "Fratta_MUT")
+
+
+separate_genes <- map(indiv_w, filter, padj < 0.05) %>% map("EnsemblID")
+
+
+
+
+# totals <- map(indiv, ~{
+#   filter(.x, padj < 0.05) %>%
+#   pull("EnsemblID") %>%
+#   length()
+# })
+
+totals <- map(indiv_w, ~{
+  filter(.x, padj < 0.05) %>%
+  pull("EnsemblID") %>%
+  length()
+})
+
+
+joint_all_genes <- unique(c(joint_ko_genes, joint_mut_genes))
+
+ko_overlap <- map(separate_genes, intersect, y = joint_ko_genes) %>% map(length)
+mut_overlap <- map(separate_genes, intersect, y = joint_mut_genes) %>% map(length)
+#non_overlap <- map(separate_genes, setdiff, y = joint_all_genes) %>% map(length)
+# 
+# indiv_matched <- indiv %>% map( ~{
+#   .x <- filter(.x, padj < 0.05)
+#   .x$joint_ko <- match(.x$EnsemblID, joint_ko_genes)
+#   .x$joint_mut <- match(.x$EnsemblID, joint_mut_genes)
+#   .x
+# })
+
+single_vs_joint <- 
+  bind_rows( totals, ko_overlap, mut_overlap) %>%
+  mutate(n = c("total", "overlapping joint KO", "overlapping joint MUT")) %>%
+  dplyr::select( n, ends_with("MUT"), ends_with("KO") )
+  
+write.csv(single_vs_joint, file = "results/02_DESeq/single_vs_joint_numbers_gene_expression_per_gene.csv")
+
+# extract lfcs and pvalues for each gene in the joint model
+all_genes <- combined$EnsemblID
+
+combine_individuals <-
+  map2( indiv_w, names(indiv_w), ~{
+    d <- .x %>%
+    dplyr::select(EnsemblID, log2FoldChange, pvalue) 
+    names(d)[2:3] <- paste(.y, names(d)[2:3])
+    d
+ }) %>%
+  purrr::reduce( left_join, by = "EnsemblID")
+
+filter(combine_individuals, EnsemblID %in% filter(combined, status_relaxed == "Overlapping")$EnsemblID) %>% 
+  dplyr::select( EnsemblID, contains("log2FoldChange")) %>%
+  #head(100) %>%
+  tidyr::gather( key = "dataset", value = "foldchange", -EnsemblID) %>%
+  #mutate(foldchange = as.character(sign(foldchange))) %>%
+  ggplot( aes(x = EnsemblID, y = dataset)) +
+  geom_tile(aes(fill = foldchange)) +
+  scale_fill_gradient2()
+
+
+```
+
+# supplementary plot - how the joint fold change emerges from the 3 contributing datasets
+
+```{r}
+
+# join the individual lfcs and p values with the joint results
+complete <- left_join(combine_individuals, combined, by = "EnsemblID")
+
+# split out KO and MUT
+complete_mut <- dplyr::select(complete, EnsemblID, contains("MUT"), contains("mut"), status_relaxed)
+complete_ko <- dplyr::select(complete, EnsemblID, contains("KO"), contains("ko"), status_relaxed)
+
+names(complete_mut) <- c("EnsemblID", "Bozzoni_LFC", "Bozzoni_P", "Dupuis_LFC", "Dupuis_P", "Fratta_LFC", "Fratta_P", "Joint_P", "Joint_LFC", "Joint_q", "Joint_Z", "status")
+names(complete_ko) <- c("EnsemblID", "Bozzoni_LFC", "Bozzoni_P", "Dupuis_LFC", "Dupuis_P", "Fratta_LFC", "Fratta_P", "Joint_P", "Joint_LFC", "Joint_q", "Joint_Z", "status")
+
+# plot the LFCs in the three datasets for each ordered by the joint LFC
+lfc_plot <- 
+  function( df, mytitle){
+  df %>%
+  filter( Joint_q < 0.05) %>%
+  arrange(Joint_LFC) %>%
+  mutate(gene_order = factor(EnsemblID, levels = EnsemblID) ) %>%
+  dplyr::select(gene_order, contains("_LFC")) %>%
+  tidyr::gather(key = "Dataset", value = "LFC", -gene_order) %>%
+  mutate( Dataset = gsub("_LFC", "", Dataset) ) %>%
+  mutate( LFC = ifelse( LFC > 1.5, Inf, ifelse(LFC < -1.5, -Inf, LFC) )  ) %>%
+  ggplot( aes(x = gene_order, y = LFC, colour = Dataset)) +
+  geom_point( size = 0.1, alpha = 0.5) +
+  scale_colour_manual("", 
+                      breaks = c("Bozzoni", "Dupuis", "Fratta", "Joint"),
+                      values = c("red", "blue", "green", "Black")) +
+  ylab(expression( log[2]~fold~change) ) +
+  theme( axis.text.x = element_blank(),
+         axis.ticks.x = element_blank(),
+         legend.key = element_rect( fill = "white"),
+         panel.grid = element_blank(),
+         panel.background = element_rect(fill = "white", colour = "black")
+         ) +
+  ylim(-1.5,1.5) +
+  geom_hline(yintercept = 0, linetype = 1, colour = "grey") +
+  labs( title = mytitle) +
+  xlab("Genes at joint FDR < 0.05") +
+  guides(colour = FALSE)
+}
+
+# plot p values too
+p_plot <- function(df, mytitle){
+  df %>%
+  filter( Joint_q < 0.05) %>%
+  arrange(-log10(Joint_P) ) %>%
+  mutate(gene_order = factor(EnsemblID, levels = EnsemblID) ) %>%
+  dplyr::select(gene_order, contains("_P")) %>%
+  tidyr::gather(key = "Dataset", value = "P_value", -gene_order) %>%
+  mutate( Dataset = gsub("_P", "", Dataset) ) %>%
+  mutate( P_value = -log10(P_value)) %>%
+  mutate( P_value = ifelse( P_value > 25, Inf, P_value)) %>%
+  ggplot( aes(x = gene_order, y = P_value, colour = Dataset)) +
+  geom_point( size = 0.1, alpha = 0.5) +
+  scale_colour_manual("", 
+                      breaks = c("Bozzoni", "Dupuis", "Fratta", "Joint"),
+                      values = c("red", "blue", "green", "black")) +
+  ylab(expression( -log[10]~P~value) ) +
+  theme( axis.text.x = element_blank(),
+         axis.ticks.x = element_blank(),
+         legend.key = element_rect( fill = "white"),
+         panel.grid = element_blank(),
+         panel.background = element_rect(fill = "white", colour = "black")
+         ) +
+  ylim(0,25) +
+  geom_hline(yintercept = 0, linetype = 1, colour = "grey") +
+  labs( title = mytitle) +
+  xlab("Genes at joint FDR < 0.05") +
+  guides(colour = FALSE)
+}
+
+
+multi_plot <- 
+  (
+    lfc_plot(complete_ko, "A  KO fold changes") +
+    p_plot(complete_ko, "KO P-values")
+  ) /
+  ( 
+    lfc_plot(complete_mut, "B  MUT fold changes") +
+    p_plot(complete_mut, "MUT P-values") 
+  ) +
+  plot_annotation(caption = c("Bozzoni (red), Dupuis (blue), Fratta (green), Joint analysis (black)"))
+
+ggsave(multi_plot, filename = "figures/Gene_Expression/fitted_vs_individual_p_lfc.pdf", width = 8, height = 6)
+
+
+```
+
+
+
+
+## Summary
+
+Genes upregulated in both condition are strongly enriched in genes with RNA binding and RNA transport terms whereas genes that are downregulated in both are enriched in neuronal and synaptic terms. 
+This is broadly true of the KO specific genes as well but MUT specific genes are odd.

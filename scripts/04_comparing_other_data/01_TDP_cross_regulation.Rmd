@@ -1,0 +1,216 @@
+---
+title: "TDP-43 cross-regulation"
+author: "Jack Humphrey"
+date: "12/12/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "~/google_drive/Work/PhD_Year_4/FUS_meta-analysis/")
+library(readr)
+library(tidyr)
+library(purrr)
+library(dplyr)
+library(stringr)
+```
+
+There are clear TDP-43 iCLIP peaks in the FUS retained introns. This suggests that TDP-43 cross-regulates FUS. Are there changes in FUS intron retention in our TDP-43 mouse data?
+For each dataset, load in the SGSeq results and find the FUS introns and exon 7 skipping
+Extract PSIs for case and control
+Make a set of plots using existing code.
+
+```{r}
+i6 <- "chr7:127972770-127974400"
+i7 <- "chr7:127974434-127975888"
+e7 <- "chr7:127972770-127975888"
+```
+
+
+
+## Cleveland TDP-43 knockdown
+
+
+```{r}
+cleveland <- "data/SGSeq/TDP/sgseq_Cleveland_TDP43_KD.tab"
+d <- read_tsv(cleveland)
+
+fus <- filter(d, geneName == "Fus")
+
+# extract intron 6 and 7
+
+
+intron6 <- filter(fus, coords == i6, variantType == "RI:R")
+intron7 <- filter(fus, coords == i7, variantType == "RI:R")
+exon7   <- filter(fus, coords == e7, variantType == "SE:I+RI:R+A5SS:P+A3SS:P")
+
+getPSI <- function(df, event){
+  psi <- select(df, ends_with("_psi")) %>%
+    tidyr::gather(key = "sample", value = "psi") %>%
+    mutate(condition = str_split_fixed(sample, pattern = "_", n = 3)[,1] ) %>%
+    mutate( event = event, padj = df$padj, pvalue = df$pvalue) %>%
+    mutate(condition = case_when(
+      condition == "Control" ~ "CTL",
+      condition == "MUT" ~ "TDP-43 KD"
+    )) 
+  
+}
+
+cleveland_psi <- 
+  list(intron6, intron7, exon7) %>%
+  map2_df( .y = c("intron6", "intron7", "exon7"), getPSI)
+
+
+
+```
+
+## M323K adult
+
+```{r}
+m323k_adult <- "data/SGSeq/TDP/M323K_New_CONTROL_HOM_res_clean_novel.tab"
+d <- read_tsv(m323k_adult)
+fus <- filter(d, external_gene_ID == "Fus")
+
+intron6 <- filter(fus, coords == i6, variantType == "RI:R")
+intron7 <- filter(fus, coords == i7, variantType == "RI:R")
+exon7   <- filter(fus, coords == e7, variantType == "SE:I+RI:R+A5SS:P+A3SS:P")
+
+getPSI <- function(df, event){
+  psi <- select(df, ends_with("_psi")) %>%
+    tidyr::gather(key = "sample", value = "psi") %>%
+    mutate(condition = str_split_fixed(sample, pattern = "_", n = 4)[,2] ) %>%
+    mutate(condition = case_when(
+      condition == "WT" ~ "CTL",
+      condition == "HOM" ~ "M323K HOM"
+    ))  %>%
+    mutate( event = event, padj = df$padj, pvalue = df$pvalue)
+  
+}
+
+m323k_adult_psi <- 
+  list(intron6, intron7, exon7) %>%
+  map2_df( .y = c("intron6", "intron7", "exon7"), getPSI)
+
+
+```
+
+## F210I embryo
+
+```{r}
+f210i_embryo <- "data/SGSeq/TDP/sgseq_f210i_embryonic_brain_hom.tab"
+d <- read_tsv(f210i_embryo)
+
+fus <- filter(d, external_gene_name == "Fus") %>%
+  mutate( coords = paste0(chrom, ":", chromStart, "-", chromEnd) )
+
+intron6 <- filter(fus, coords == i6, variantType == "RI:R")
+intron7 <- filter(fus, coords == i7, variantType == "RI:R")
+exon7   <- filter(fus, coords == e7, variantType == "SE:I+RI:R+A5SS:P+A3SS:P")
+
+getPSI <- function(df, event){
+  psi <- select(df, ends_with("norm_psi")) %>%
+    tidyr::gather(key = "sample", value = "psi") %>%
+    mutate(condition = str_split_fixed(sample, pattern = "_", n = 4)[,2] ) %>%
+    mutate(condition = case_when(
+      condition == "CTL" ~ "CTL",
+      condition == "HOM" ~ "F210I HOM"
+    ))  %>%
+    mutate( event = event, padj = df$padj, pvalue = df$pvalue)
+}
+
+f210i_embryo_psi <- 
+  list(intron6, intron7, exon7) %>%
+  map2_df( .y = c("intron6", "intron7", "exon7"), getPSI)
+
+
+
+```
+
+## F210I adult
+
+```{r}
+f210i_adult <- "data/SGSeq/TDP/F210I_adult_sc_res_clean_novel.tab"
+d <- read.table(f210i_adult,header=TRUE)
+
+fus <- filter(d, geneName == "Fus") %>%
+  mutate( chrom = str_split_fixed(from, pattern = ":", 4)[,2],
+          chromStart = str_split_fixed(from, pattern = ":", 4)[,3],
+          chromEnd = str_split_fixed(to, pattern = ":", 4)[,3] ) %>%
+  mutate( coords = paste0(chrom, ":", chromStart, "-", chromEnd) )
+
+intron6 <- filter(fus, coords == i6, variantType == "RI:R")
+intron7 <- filter(fus, coords == i7, variantType == "RI:R")
+exon7   <- filter(fus, coords == e7, variantType == "SE:I")
+
+getPSI <- function(df, event){
+  psi <- select(df, ends_with("_psi")) %>%
+    tidyr::gather(key = "sample", value = "psi") %>%
+    mutate(condition = str_split_fixed(sample, pattern = "_", n = 4)[,2] ) %>%
+    mutate( event = event, padj = df$padj)
+}
+
+f210i_adult_psi <- 
+  getPSI(exon7, "exon7")
+
+ # map2_df( .y = c("exon7"), getPSI)
+#
+
+```
+
+
+Plot PSIs for each dataset together
+
+```{r}
+library(ggplot2)
+library(ggbeeswarm)
+library(patchwork)
+
+psi_plot <- function(res, mytitle, mysub){
+  means <- res %>%
+    group_by(condition, event) %>%
+    summarise(mean = mean(psi))
+  
+  res <- left_join(res, means, by = c("condition", "event"))
+  
+  res <- mutate(res, padj = paste0("P=",signif(padj, digits=2)))
+  
+  res <- mutate(res, pvalue = paste0("P=",signif(pvalue, digits=2)))
+  
+  ggplot(data = res) + 
+  geom_beeswarm( aes(x = condition, y = psi),priority = "ascending",cex = 5) +
+  geom_errorbar( aes(x = condition, ymin = mean, ymax = mean ), width = 0.5 ) +
+  facet_wrap(~event, nrow = 3) +
+  guides(colour = FALSE) +
+  xlab("") +
+  theme_bw() +
+  ylab("PSI") +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, face = "italic"),
+   # strip.background = element_rect(colour="black", fill="white"),
+    strip.background = element_blank(),
+    axis.text.x = element_text(colour = "black")) +
+  geom_text(aes(x = 1.5, y = 1.1, label = pvalue)) +
+  ylim(0,1.19) +
+  labs(title = mytitle,subtitle = mysub)
+    #+
+  # scale_colour_manual(values = cols) +
+  # coord_cartesian(#ylim = c(0, 0.12), # This focuses the x-axis on the range of interest
+  #                 clip = 'off' # This keeps the labels from disappearing
+  # )# +#
+  # geom_text( aes( x = Condition, y = -0.03, label = Treatment ) ) +
+  # annotate(geom = "text", x = -0.01, y = -0.03, label = "CHX") +
+  # scale_x_discrete(labels = c("CTL\n","CTL\n","MUT\n","MUT\n"))
+}
+
+p <- 
+  psi_plot(cleveland_psi, "TDP-43 ASO knockdown", "adult") + 
+  psi_plot(m323k_adult_psi, "TDP-43 M323K", "adult") + 
+  psi_plot(f210i_embryo_psi, "TDP-43 F210I", "embryo")
+
+p
+
+ggsave(p, filename = "figures/Autoregulation/TDP_cross_regulation.pdf")
+```
+
+

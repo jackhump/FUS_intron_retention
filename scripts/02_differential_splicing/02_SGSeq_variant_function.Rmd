@@ -1,0 +1,554 @@
+---
+title: "SGSeq - investigating splicing variant function"
+author: "Jack Humphrey"
+date: "1 May 2018"
+output:
+    html_document:
+    code_folding: hide
+    fig_width: 9
+    df_print: paged
+    theme: cerulean
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "~/google_drive/Work/PhD_Year_4/FUS_meta-analysis/")
+library(SGSeq)
+library(DEXSeq)
+library(purrr)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(stringr)
+library(UpSetR)
+library(readr)
+library(gProfileR)
+library(plotly)
+library(patchwork)
+library(ggbeeswarm)
+```
+
+```{r, warning=FALSE, message = FALSE}
+
+support <- read_tsv("data/SGSeq/joint_analysis/novel_events/joint_SGSeq_novel_support_no_HET.tab")
+
+# load biomart mouse
+biomart <- readr::read_tsv("misc/biomart_annotations_mouse.txt")
+
+# load res.clean Rdata
+load("data/SGSeq/joint_analysis/novel_events/processed_all_joint.Rdata")
+
+# PSI creation
+loadSGVC <- function(RData){
+  load(RData)
+  return(sgvc)
+}
+
+createPSI <- function(sgvc, res.sig, support){
+  
+  all_counts <- as.data.frame(counts(sgvc))
+  all_counts$vid <- mcols(sgvc)$variantID
+  all_counts$eid <- mcols(sgvc)$eventID
+  
+  hitcounts <- filter(all_counts, eid %in% res.sig$groupID)
+  # for each event ID,
+  # split by effect ID (shared) and divide each column by the column sum to get PSI
+  psi <- 
+    split(hitcounts, hitcounts$eid) %>%
+    map_df( ~{
+      vid <- .x$vid
+      eid <- .x$eid
+      df <- sweep( .x, MARGIN = 2, STATS = colSums(.x), FUN = "/")
+      df$vid <- vid
+      df$eid <- eid
+      return(df)
+    })
+  
+  res.sig$featureID <- as.numeric(sig$featureID)
+  res.sig$groupID <- as.numeric(sig$groupID)
+  
+  # add back the variant and effect IDs
+  psi_df <-
+    psi %>%
+    dplyr::rename( featureID = vid, groupID = eid ) %>%
+    dplyr::select(featureID, groupID, everything() ) %>%
+    tidyr::gather( "sample_name", "PSI", -featureID, -groupID ) %>%
+    left_join(x = ., y = support, by = "sample_name") %>%
+    left_join(x = ., y = res.sig, by = c("featureID", "groupID") )
+  
+  return(psi_df)
+}
+
+
+psiPlot <- function(id, PSI_df = psi_df){
+  df <- filter(PSI_df, featureID == as.character(id) ) %>%
+    dplyr::select(PSI, dataset, condition, gene, type)
+  df <- df[ complete.cases(df),]
+  p <- ggplot( df, aes( x = condition, y = PSI, colour = dataset )) +
+    geom_jitter(width = 0.2, height = 0) +
+    #geom_point() +
+    theme_bw() +
+    #ylim(c(0,1)) +
+    facet_wrap(~dataset, ncol = 3, scale = "free") +
+    labs(title = paste(id, df$gene, df$type) ) +
+    guides(colour = FALSE)
+  return(p)
+}
+
+results_all <- "data/SGSeq/joint_analysis/novel_events/all_samples_joint_SGSeq_analysis_novel.Rdata"
+
+#res.clean <- cleanResults(results_all)
+
+sgvc <- loadSGVC(results_all)
+
+sig <- 
+  dplyr::filter(res.clean, status_relaxed != "None" | gene == "Tardbp") %>%
+  dplyr::select( gene,coords, type, everything() ) %>%
+  dplyr::arrange(padj)
+
+
+psi_df <- createPSI( sgvc, res.sig =  sig, support )
+
+all_counts <- as.data.frame(counts(sgvc))
+row.names(all_counts) <- mcols(sgvc)$variantID
+  
+  # use the average read count in the Fratta wildtype samples as a measure of RNA abundance
+frattaWildtypeCount <- function(variantIDs, counts = all_counts){
+
+  #all_counts$vid <- mcols(sgvc)$variantID
+  #all_counts$eid <- mcols(sgvc)$eventID
+  
+  counts <- counts[variantIDs,]
+  
+  wildtypes <- select(
+    counts, matches("Nicol.*WT") 
+    )
+  
+  # normalise counts by sizeFactors
+  sizeFactors <- DESeq2::estimateSizeFactorsForMatrix(counts = wildtypes)
+  
+  # MARGIN = 1 or 2?
+  wildtypes_norm <- sweep(wildtypes, MARGIN = 2, STATS = sizeFactors, FUN = "*")
+  
+  # get mean count
+  event_mean_norm <- rowMeans(wildtypes_norm)
+  
+  return(event_mean_norm)
+  # eid %in% res$groupID
+}
+
+# try the Bozzoni wildtypes - potentially more similar to the Rogelj samples
+# bozzoniWildtypeCount <- function(variantIDs, counts = all_counts){
+# 
+#   #all_counts$vid <- mcols(sgvc)$variantID
+#   #all_counts$eid <- mcols(sgvc)$eventID
+#   
+#   counts <- counts[variantIDs,]
+#   
+#   wildtypes <- select(
+#     counts, matches("Bozzoni.*WT") 
+#     )
+#   
+#   # normalise counts by sizeFactors
+#   sizeFactors <- DESeq2::estimateSizeFactorsForMatrix(counts = wildtypes)
+#   
+#   wildtypes_norm <- sweep(wildtypes, MARGIN = 1, STATS = sizeFactors, FUN = "*")
+#   
+#   # get mean count
+#   event_mean_norm <- rowMeans(wildtypes_norm)
+#   
+#   return(event_mean_norm)
+#   # eid %in% res$groupID
+# }
+
+
+# give each variant the mean read count in the fratta wildtypes
+res.clean$frattaBaseMean <- frattaWildtypeCount(res.clean$featureID)
+#res.clean$bozzoniBaseMean <- bozzoniWildtypeCount(res.clean$featureID)
+
+#cor.test(res.clean$frattaBaseMean, res.clean$bozzoniBaseMean)
+# correlation between fratta and  bozzoni wildtype estimates is 0.8
+
+
+```
+
+
+
+
+# Variant location within genes
+
+```{r locate_variants}
+# locate event within gene using biomart coordinates - assume the coordinates of the major isoform
+eventLocator <- function( results){
+  stopifnot( all( c("geneName", "coords") %in% names(results)))
+  # join with biomart
+    modified <- 
+      results %>%
+    rename( gene_name = gene) %>%
+   # mutate(EnsemblID = as.character(unlist(geneName)) ) %>%
+    left_join(biomart, by = c("gene_name","strand") ) %>%
+  # unpack coordinates
+    separate(coords, into = c("v.chr", "v.start", "v.end"), sep =":|-", convert = TRUE, remove = FALSE) %>%
+    filter(!is.na(gene_name)) %>%
+  mutate(
+    gene.length = end - start, 
+    event.centre = v.start +  ( (v.end - v.start) / 2 )
+   ) %>%
+  mutate(
+    rel.pos = (event.centre - start) / gene.length
+  ) %>%
+  mutate( rel.pos = ifelse(
+    strand == "-",
+    yes = 1 - rel.pos,
+    no = rel.pos
+  ) ) %>%
+  mutate( event.length = v.end - v.start) %>%
+  dplyr::select( -v.chr, -v.start, -v.end, -event.centre, -gene.length)
+     
+  return(modified)
+}
+
+event_locations <- eventLocator(res.clean)
+
+res.clean$rel.pos <- event_locations$rel.pos[ match( res.clean$featureID, event_locations$featureID)]
+
+# fails on NA genes
+# res.clean$event.length <- event_locations$event.length[ match( res.clean$featureID, event_locations$featureID)]
+
+event.lengths <-
+  res.clean %>%
+  separate(coords, into = c("v.chr", "v.start", "v.end"), sep =":|-", convert = TRUE, remove = FALSE) %>%
+  mutate(event.length = v.end - v.start ) %>%
+  pull(event.length)
+  
+res.clean$event.length <- event.lengths
+
+
+```
+
+
+```{r plot event lengths and locations}
+
+res.clean %>%
+  filter(padj < 0.05) %>%
+  ggplot( aes(x = rel.pos, y = -log10(pvalue), colour = type))+
+  geom_point() +
+  facet_wrap(~type, scale = "free_y") +
+  xlim(0,1) +
+  theme_bw() +
+  guides(colour = FALSE) +
+  theme(strip.background = element_rect(colour="black", fill="white") )
+
+res.clean %>% filter( -log10(pvalue) > 5, type == "RI") %>%
+  dplyr::select( gene, featureID, contains("log2"), coords, rel.pos) #%>%
+  #knitr::kable()
+ 
+
+# retained introns - are they longer?
+res.clean %>%
+  filter(type == "RI", status_relaxed %in% c("None", "Overlapping")) %>%
+  ggplot( aes(x = status_relaxed, y = log10(event.length) )) +
+  geom_boxplot(notch = TRUE) 
+
+
+```
+
+
+# Create GenomicRanges object from res.clean for overlapping with other GenomicRanges data
+
+```{r}
+# convert res to GRange
+
+res.grange <- 
+  res.clean %>%
+  separate(coords, into = c("v.chr", "v.start", "v.end"), sep = ":|-") %>%
+  dplyr::select( v.chr, v.start, v.end, strand, gene, pvalue, padj, log2foldchange = log2fold_FUS_KO_CTL, featureID, type) 
+
+res.grange <- GenomicRanges::GRanges(seqnames = res.grange$v.chr,
+                                    ranges = IRanges(start = as.numeric(res.grange$v.start),
+                                                     end =  as.numeric(res.grange$v.end)
+                                    ),
+                                    strand = res.grange$strand,
+                                    gene = res.grange$gene,
+                                    pvalue = res.grange$pvalue,
+                                    padj = res.grange$padj,
+                                    log2foldchange = res.grange$log2foldchange,
+                                    featureID = res.grange$featureID,
+                                    type = res.grange$type
+
+)
+```
+
+# PolyAdenylation
+
+```{r polyA plot}
+# read in Zavolan lab mouse polyA sites
+polya <- read_tsv("misc/polyAsite_mm10.bed",col_names = c("chr", "start","end", "name", "score", "strand", "meta", "gene"), col_types = "ciiciccc" )
+
+# apply filtering on score - cleavage site must be seen in at least 2 datasets
+polya  <- filter(polya, score > 1)
+
+# convert to GRanges
+polya <- GenomicRanges::GRanges(seqnames = polya$chr, 
+                                ranges = IRanges(start = polya$start, end = polya$end),
+                                strand = polya$strand,
+                                gene = polya$gene,
+                                name = polya$name,
+                                score = polya$score,
+                                meta = polya$meta)
+# match in gene name from biomart
+mcols(polya)$gene_name <- biomart$gene_name[match(mcols(polya)$gene, biomart$EnsemblID)]
+
+
+
+# find nearest polyA
+nearest_polya <- GenomicRanges::nearest(
+  x = res.grange,
+  subject = polya)
+
+# set 2 NA values to 1 - fudge
+nearest_polya[ is.na(nearest_polya)] <- 1
+
+# get the polya sites in question
+nearest_polya <- polya[
+  nearest_polya
+]
+
+# calculate distances
+res.clean$polya.distance <- GenomicRanges::distance(x = res.grange, y = nearest_polya)
+
+```
+
+# Using FUS iCLIP
+
+# control - compare to Boris's TDP-43 and U2AF65 as well.
+
+```{r iCLIP}
+# Rogelj et al FUS E18 all clusters
+fus_iclip <- "data/iCLIP/peaks_id72803_rnd100_flank15_fdr0.1_group_3094_FUS-E18-all_sum_G_mm10--ensembl59_from_2320-3089-3090_bedGraph-cDNA-hits-in-genome.bed.gz_lowFDR_clusters_stranded_sorted.bed"
+
+u2af_iclip <- "data/iCLIP/peaks_id72809_rnd100_flank15_fdr0.1_group_2408_Mouse-brain-U2AF65_sum_G_mm10--ensembl59_from_1240-1241_bedGraph-cDNA-hits-in-genome.bed.gz_lowFDR_clusters_stranded.bed.gz"
+  
+tdp_iclip <- "data/iCLIP/peaks_id72808_rnd100_flank100_fdr0.1_group_1547_TDP43-TDP-43-CLIP-E18-brain_sum_G_mm10--ensembl59_from_1192-1200-900_bedGraph-cDNA-hits-in-genome.bed.g_lowFDR_clusters_stranded.bed.gz"
+
+iclipDistance <- function(iclip_path){
+  
+  iclip <- rtracklayer::import.bed(iclip_path)
+  score(iclip) <- abs(as.numeric(mcols(iclip)$name))
+
+  # filter by number of reads
+  iclip <- iclip[ iclip$score >= 2 ]
+
+  nearest_iclip <- iclip[
+    GenomicRanges::nearest(
+    x = res.grange,
+    subject = iclip)
+  ]
+
+  distances <- GenomicRanges::distance(x = res.grange, y = nearest_iclip)
+
+  return(distances)
+}
+
+res.clean$iclip.distance <- iclipDistance(fus_iclip)
+
+res.clean$iclip.distance.tdp <- iclipDistance(tdp_iclip)
+
+res.clean$iclip.distance.u2af <- iclipDistance(u2af_iclip)
+
+```
+
+# Conservation - use PhyloP 60 way
+
+```{r conservation}
+
+# phyloP 60 way - per nucleotide conservation of mouse against 59 other species
+
+##PROBLEM WITH FUNCTION - NOT MATCHING PROPERLY
+
+perIntronConservation <- function( introns ){
+  #for testing
+  #introns <- ir[1:2,]t
+  url <- "/Users/jack/Software/big_data/mm10.60way.phyloP60way.bw"
+
+  grange <- res.grange[ mcols(res.grange)$featureID %in% introns$featureID ]
+  
+  phyloP <- rtracklayer::import.bw(con = url, selection = grange)
+  
+  # split grange into list and find overlaps from phyloP that way
+  
+  grange_list <- as.list(grange)
+  
+  medianScores <- 
+    map_dbl( grange_list, ~{
+      overlaps <- queryHits( findOverlaps(phyloP, .x) )
+      scores <- phyloP[overlaps]
+      #meanScore <- mean( score(scores))
+      medianScore <- median(score(scores))
+      return(medianScore)
+  })
+  
+  names(medianScores) <- introns$featureID
+
+  return(medianScores)
+}
+
+# calculate conservation scores for retained introns and complex events
+
+#introns <- filter(res.clean, type == "RI" | type == "COMPLEX", padj < 0.05)
+sig <- filter(res.clean, status_relaxed != "None" & type %in% c("RI", "COMPLEX", "SE") )
+
+# no longer random sample
+# calculate length and expression distributions for significant events of each type
+# pick null set based on these
+
+regulariseNull <- function(vartype = "SE", varstatus = "Overlapping"){
+  sig <- filter(res.clean, status_relaxed == varstatus, type == vartype)
+  null <- filter(res.clean, status_relaxed == "None", type == vartype)
+
+  sig_depth <- log10(sig$frattaBaseMean) 
+
+  sig_depth_quartile1 <- summary(sig_depth)[2]
+  sig_depth_quartile3 <- summary(sig_depth)[5]
+
+  null <- filter(null,
+                 frattaBaseMean >= 10^sig_depth_quartile1 &
+                   frattaBaseMean <= 10^sig_depth_quartile3
+  )
+  
+  sig_length <- log10(sig$event.length) 
+
+  sig_length_quartile1 <- summary(sig_length)[2]
+  sig_length_quartile3 <- summary(sig_length)[5]
+
+  null <- filter(null,
+                 event.length >= 10^sig_length_quartile1 &
+                 event.length <= 10^sig_length_quartile3
+  )
+  
+  return(null)
+}
+
+
+# null_RI <- filter(res.clean, status_relaxed == "None", padj > 0.5 & type == "RI") %>%
+#   sample_n(size = 1000, replace = FALSE)
+# 
+# null_SE <- filter(res.clean, status_relaxed == "None", padj > 0.5 & type == "SE") %>%
+#   sample_n(size = 1000, replace = FALSE)
+# 
+# null_COMPLEX <- filter(res.clean, status_relaxed == "None", padj > 0.5 & type == "COMPLEX") %>%
+#   sample_n(size = 1000, replace = FALSE)
+
+null_RI_overlap <- regulariseNull(vartype = "RI",varstatus = "Overlapping")
+null_SE_overlap <- regulariseNull(vartype = "SE",varstatus = "Overlapping")
+null_COMPLEX_overlap <- regulariseNull(vartype = "COMPLEX",varstatus = "Overlapping")
+
+null_RI_ko <- regulariseNull(vartype = "RI",varstatus = "Knockout specific")
+null_SE_ko <- regulariseNull(vartype = "SE",varstatus = "Knockout specific")
+null_COMPLEX_ko <- regulariseNull(vartype = "COMPLEX",varstatus = "Knockout specific")
+
+
+
+variants_of_interest <- 
+  list(sig, null_RI_overlap, null_SE_overlap, null_COMPLEX_overlap, null_RI_ko, null_SE_ko, null_COMPLEX_ko) %>%
+  purrr::reduce(rbind) %>%
+  dplyr::distinct()
+
+#for testing
+#variants_of_interest <- sig
+
+# split into chunks of 100
+tiles <- ntile(1:nrow(variants_of_interest), n = floor( nrow(variants_of_interest) / 120) )
+
+chunks <- split( variants_of_interest, f = tiles)
+
+chunk_phyloP <- map(chunks, perIntronConservation)
+# bring chunks together - unlist ends up concatenating the list element number to the names of each vector element.
+intron_phyloP <- purrr::reduce( chunk_phyloP, c)
+
+
+# match back by featureID
+intron_phyloP_df <- tibble(
+  featureID = names(intron_phyloP),
+  phyloP = intron_phyloP
+)
+
+if( "phyloP" %in% names(res.clean) ){
+  res.clean$phyloP <- NULL
+}
+
+res.clean <- left_join(res.clean, intron_phyloP_df, by = "featureID")
+
+```
+
+# Minor intron genes - any enrichment?
+
+```{r}
+u12_data <- read_tsv("data/U12DB/u12_mouse.txt")
+u12_gff <- (rtracklayer::import.gff("data/U12DB/u12_mouse.gff"))
+
+
+
+seqlevels(u12_gff, pruning.mode = "coarse") <- c(seqlevels(u12_gff)[1:20], "chrY")
+#seqlevels(res.grange, pruning.mode = "coarse") <- seqlevels(u12_gff)
+# missing chrY - have to be creative
+
+nearest_minor <- 
+  GenomicRanges::nearest(
+    x = res.grange,
+    subject = u12_gff)
+
+nearest_minor[ is.na(nearest_minor) ] <- 1
+
+nearest_minor_u12 <- 
+  u12_gff[nearest_minor]
+
+minor_intron_distances <- GenomicRanges::distance(x = res.grange, y = nearest_minor_u12)
+
+res.clean$minor.distance <- minor_intron_distances
+
+# only 5 significantly altered splicing events are in minor introns. 
+
+# instead look at overlap at the gene level. 
+u12_introns <-
+  u12_gff %>%
+  as.data.frame() %>%
+  as_tibble() %>%
+  mutate( group = as.integer(as.character(group)))
+
+u12 <- left_join(u12_data, u12_introns, by = c("id" = "group") )
+
+u12_genes <- u12_data$gene_name
+u12_genes <- u12_genes[ !is.na(u12_genes)]
+
+res.clean$minor.gene <- res.clean$gene %in% u12_genes
+# 
+# table(minor = res.clean$minor.gene, 
+#      group = res.clean$status_relaxed, 
+#      type = res.clean$type
+#       )
+
+```
+
+
+Save results.
+
+```{r}
+write_tsv(x = res.clean, path = "tables/sgseq_splicing_event_function.tsv")
+
+save(res.clean, psi_df,sgvc, biomart,support, file = "results/03_SGSeq/sgseq_splicing_event_function.RData")
+
+```
+
+
+
+
+
+
+Save skipped intron genes to check differential expression:
+
+Genes are generally not differentially expressed.
+
+
+
+
