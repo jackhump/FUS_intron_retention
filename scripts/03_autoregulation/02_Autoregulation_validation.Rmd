@@ -357,3 +357,106 @@ ggsave("figures/Autoregulation/rt_pcr_fractionation_psi.pdf", plot = fract_scatt
 
 ```
 
+
+# Eberle human UPF1 knockdown and FUS overexpression experiments
+
+```{r}
+data <- readxl::read_excel(path = "Validation/Eberle_human_RT/erbele_tidy.xlsx")
+
+df <- data %>%
+  mutate(condition = paste0(cell_line, "\n", knockdown) ) %>%
+  mutate(condition = factor(condition, 
+                            levels = c("HeLa\nscramble", "HeLa\nUPF1",
+                                       "GFP\nscramble", "GFP\nUPF1",
+                                       "FUS\nscramble", "FUS\nUPF1")
+                            ))
+means <- df %>% 
+  group_by(condition, primers) %>%
+  summarise( mean_value = mean(value) ) 
+
+df <- bind_rows(df,means)
+
+# save hnRNP L NMD positive control for supplementaries
+
+hnrnpl <- filter(df, primers == "hnRNPL_NMD")
+
+main_plots <- filter(df, primers != "hnRNPL_NMD")
+
+eberle_plot <- function(data){
+  
+  max_value <- max(data$value, na.rm = TRUE) + (0.2 * max(data$value, na.rm = TRUE) ) 
+  
+  data %>%
+    ggplot() +
+    geom_beeswarm( aes(x = condition, y = value, colour = cell_line, alpha = knockdown), priority = "ascending",cex = 3  ) + 
+    geom_errorbar(data = data, aes(x = condition, ymin = mean_value, ymax = mean_value ), width = 0.5 ) +
+    #facet_wrap(~primers, scales = "free_y", nrow = 1) +
+    scale_colour_manual(values = c("HeLa" = "darkgray", "GFP" = "gray", "FUS" = "green")) +
+    scale_alpha_manual( values = c("scramble" = 1, "UPF1" = 0.7)) +
+    guides(colour = FALSE, alpha = FALSE) +
+    theme_bw() +
+    theme(
+      axis.line = element_line(colour = "black"),
+      strip.background = element_blank(),
+      text = element_text(colour = "black"),
+      panel.background = element_rect(fill = "white", colour = NA),
+      panel.grid = element_blank(),
+      panel.spacing.x = unit(0, "lines"),
+      panel.border = element_blank(),
+      plot.title = element_text(hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5)
+    ) + xlab("") + ylab("") +
+    ylim(0, max_value) + 
+    labs(title = unique(data$primers))
+}
+
+# do stats
+
+eberle_anova <- function(data){
+  # remove means
+  values <- filter(data, is.na(mean_value) )
+  # fit anova
+  anova <- aov( value ~ cell_line * knockdown, data = values)
+  anova_res <- tidy(anova)
+  tukey <- TukeyHSD(anova)
+  # pairwise t-test
+  t_tests <- pairwise.t.test(x = values$value, g = paste(values$cell_line, values$knockdown) )
+  
+  return(list(
+    anova = anova_res,
+    tukey = tukey,
+    t_tests = t_tests
+  ))
+}
+
+
+# SUPPLEMENTARY FIGURE - NMD positive control
+
+eberle_plot(hnrnpl)
+
+ggsave( plot = eberle_plot(hnrnpl), filename = "figures/Autoregulation/eberle_hnrnpl_nmd.pdf", width = 5, height = 5)
+
+eberle_anova(hnrnpl)
+
+
+## MAIN PLOTS
+
+main_plots <- split(main_plots, f = main_plots$primers)
+
+eberle_plots <- purrr::map(main_plots, eberle_plot)
+
+for( i in 1:length(eberle_plots)){
+  plot <- eberle_plots[[i]]
+  title <- paste0("figures/Autoregulation/eberle_", names(eberle_plots)[i], ".pdf")
+  print(title)
+  ggsave(filename = title, plot = plot, width =3, height = 3)
+}
+
+eberle_anova <- purrr::map(main_plots, eberle_anova)
+
+```
+
+Two-way ANOVA with formula value ~ cell_line * knockdown. cell_line P = 0.83; knockdown P = 9.9e-5; interaction P = 0.87. Pairwise t-tests: HeLa scramble vs UPF1 P = 0.078; GFP scramble vs UPF1 P = 0.1; FUS scramble vs UPF1 P = 0.042.
+
+
+

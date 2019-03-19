@@ -2,7 +2,7 @@
 
 **Jack Humphrey**
 
-bioRxiv link here
+[paper now on bioRxiv](https://www.biorxiv.org/content/10.1101/567735v1)
 
 All code written in R and presented as Rmarkdown documents for readability.
 
