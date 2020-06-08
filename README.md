@@ -2,7 +2,7 @@
 
 **Jack Humphrey**
 
-[paper now on bioRxiv](https://www.biorxiv.org/content/10.1101/567735v1)
+[paper now published at Nucleic Acids Research](https://academic.oup.com/nar/advance-article/doi/10.1093/nar/gkaa410/5849905)
 
 All code written in R and presented as Rmarkdown documents for readability.
 
